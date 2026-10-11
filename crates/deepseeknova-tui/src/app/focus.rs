@@ -159,8 +159,14 @@ impl AppState {
                 _ => KeyAction::None,
             };
         }
-        // 任意非 Esc 键复位退出确认。
-        if key.code != KeyCode::Esc {
+        // 任意非退出键复位退出确认。Esc 是「二次确认退出」的首键；Ctrl+C /
+        // Ctrl+D 是退出/取消的候选键（handle_editor_key 内部按输入状态路由到
+        // confirm_quit）——它们不能在此复位，否则第二按永远进不了退出分支，
+        // 表现为「Ctrl+C 双按 / 空输入 Ctrl+D 无法退出」。
+        let is_quit_candidate = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if !is_quit_candidate {
             self.disarm_quit();
         }
         // ctrl+x 双键序列（低频高危动作专用，Claude Code 同款设计）：
@@ -1181,6 +1187,43 @@ mod tests {
         assert!(app.quit_armed);
         app.handle_key(&key(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(!app.quit_armed, "任意非 Esc 键复位");
+    }
+
+    #[test]
+    fn ctrl_c_double_press_quits_via_handle_key() {
+        // 回归：退出候选键（Ctrl+C/Ctrl+D）不能在上层 handle_key 被
+        // disarm_quit 复位，否则第二按永远进不了退出分支。
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut app = AppState::default();
+        assert_eq!(
+            app.handle_key(&ctrl_c),
+            KeyAction::None,
+            "空闲 Ctrl+C 首按置位"
+        );
+        assert!(app.quit_armed);
+        assert_eq!(
+            app.handle_key(&ctrl_c),
+            KeyAction::Quit,
+            "空闲 Ctrl+C 再按退出"
+        );
+        assert!(app.quit_armed, "退出分支保留置位状态");
+    }
+
+    #[test]
+    fn ctrl_d_double_press_quits_via_handle_key_on_empty_input() {
+        let ctrl_d = key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let mut app = AppState::default();
+        assert_eq!(
+            app.handle_key(&ctrl_d),
+            KeyAction::None,
+            "空输入 Ctrl+D 首按置位"
+        );
+        assert!(app.quit_armed);
+        assert_eq!(
+            app.handle_key(&ctrl_d),
+            KeyAction::Quit,
+            "空输入 Ctrl+D 再按退出"
+        );
     }
 
     #[test]
