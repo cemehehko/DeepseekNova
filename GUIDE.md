@@ -545,9 +545,9 @@ drift-detection = "soft"             # 工具族连续失败 ≥3 → DriftFindi
 ```toml
 [memory]
 auto_learn = true                  # 回合结束自动沉淀（默认 true）
-embedder = "none"                  # 嵌入后端：none | remote（默认 none）
-embed_model = ""                   # embedder=remote 时必填（如 text-embedding-3-small）
-embed_base_url = "https://api.openai.com/v1"  # 远程嵌入服务基础 URL
+embedder = "none"                  # 嵌入后端：none | local（Ollama）| remote（默认 none）
+embed_model = ""                   # embedder=remote/local 时必填（如 text-embedding-3-small / qwen3-embedding:0.6b）
+embed_base_url = "https://api.openai.com/v1"  # 远程嵌入服务基础 URL（local 未配置时回落 http://localhost:11434/v1）
 embed_timeout_secs = 30            # 嵌入请求超时（秒）
 llm_distill = false                # 默认 false：启用后用 LLM 把任务观察蒸馏成
                                    # 可复用 skill/教训（Skill 类目，去重 + 脱敏）
@@ -577,8 +577,15 @@ stage / recency，权重 `rank_lifecycle_weight`，=0 时与纯 bm25 等价）�
 旧记忆用 `deepseeknova-cli memory embed-backfill` 显式回填（跳过 archived）；
 `memory stats` 输出 `embedded=N/total=M` 显示覆盖率。
 
-**代码图语义检索（可选）**：同一 `embedder = "remote"` 生效后，代码图索引
-（`search_code` 等图工具）自动启用语义检索（写入即嵌入 + `w*bm25 +
+**本地语义检索（可选）**：`embedder = "local"`（或 `"ollama"`）走本地 Ollama 的
+OpenAI 兼容 `/v1/embeddings` 端点，**无需 API key**（空 key 时不发送
+`Authorization` 头）。`embed_base_url` 未显式配置时自动指向
+`http://localhost:11434/v1`，`embed_model` 用本地已拉取的模型名（如
+`qwen3-embedding:0.6b`，`ollama pull` 后可用）。本地服务不可达时同样 fail-open
+回落纯 FTS。
+
+**代码图语义检索（可选）**：任一 embedder 生效后（`remote` 或 `local`/`ollama`），
+代码图索引（`search_code` 等图工具）自动启用语义检索（写入即嵌入 + `w*bm25 +
 (1-w)*余弦` 融合，默认 w=0.5）；缺 key/网络错 fail-open 回落纯 FTS。旧索引
 无需重建（SCHEMA 增量加向量表，打开即迁移）。
 

@@ -558,13 +558,16 @@ pub struct MemoryConfig {
     /// 写入前脱敏（auto_learn 的硬前提）。
     #[serde(default = "default_true")]
     pub redact_secrets: bool,
-    /// 嵌入后端：none | local | remote（P1 恒为 none）。
+    /// 嵌入后端：`none` | `local`（Ollama，无鉴权）| `ollama`（同 `local`）| `remote`
+    /// （OpenAI 兼容远程服务，需 key）。
     #[serde(default = "default_embedder")]
     pub embedder: String,
-    /// 嵌入模型名（`embedder=remote` 时必填，如 text-embedding-3-small）。
+    /// 嵌入模型名（`embedder=remote`/`local`/`ollama` 时必填，如
+    /// `text-embedding-3-small` 或 `qwen3-embedding:0.6b`）。
     #[serde(default)]
     pub embed_model: String,
-    /// 嵌入服务基础 URL（`embedder=remote` 时使用；默认 OpenAI v1）。
+    /// 嵌入服务基础 URL（`embedder=remote` 时使用，默认 OpenAI v1；`local`/`ollama`
+    /// 未显式配置时回落 `http://localhost:11434/v1`）。
     #[serde(default = "default_embed_base_url")]
     pub embed_base_url: String,
     /// 嵌入请求超时（秒，默认 30）。

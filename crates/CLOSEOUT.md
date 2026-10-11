@@ -115,7 +115,9 @@
 6. 提交：分支 feat/semantic-retrieval（不 push，是否提交/推送由用户决定）
 
 ## 遗留（如实）
-- local embedder 未实现：配置 `embedder="local"` 会显式 warn 并回落 FTS（不会静默）。
+- local embedder 已实现（2026-10-11）：`embedder="local"`/`"ollama"` 走 OpenAI 兼容
+  `POST {embed_base_url}/embeddings`（默认 `http://localhost:11434/v1`），无鉴权
+  （空 key 不发 `Authorization`），不再回落 FTS。remote 路径保持需 key 的既有行为。
 - 代码图侧语义检索仍未做（BLOCKED 已记）。
 - `RemoteEmbedder::embed` 是同步 trait 内 `block_on`：在 async 工具路径会阻塞一个
   worker 线程至多一个超时（默认 30s）；有独立 runtime + 超时兜底，已在 GUIDE 记录，

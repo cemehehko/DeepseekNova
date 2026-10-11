@@ -111,15 +111,51 @@ impl RemoteEmbedder {
         )
     }
 
+    /// 从 `[memory]` 配置装配本地后端（`embedder = "local"` / `"ollama"`）。
+    /// 走 OpenAI 兼容的 `POST {embed_base_url}/embeddings`（Ollama 原生支持），
+    /// 但**不要求** API key：本地服务无鉴权，空 key 时请求不携带
+    /// `Authorization` 头。默认 `embed_base_url` 指向 Ollama
+    /// `http://localhost:11434/v1`。
+    pub fn from_ollama_config(config: &MemoryConfig) -> Result<Self, DeepseeknovaError> {
+        if config.embedder != "local" && config.embedder != "ollama" {
+            return Err(DeepseeknovaError::config(format!(
+                "[memory] embedder must be \"local\" or \"ollama\" (current: {:?})",
+                config.embedder
+            )));
+        }
+        if config.embed_model.trim().is_empty() {
+            return Err(DeepseeknovaError::config(
+                "[memory] embed_model is required when embedder=local/ollama".to_string(),
+            ));
+        }
+        // 本地未显式配置 base_url（仍为 OpenAI 默认值）→ 指向 Ollama。
+        let base_url = if config.embed_base_url.is_empty()
+            || config.embed_base_url == "https://api.openai.com/v1"
+        {
+            "http://localhost:11434/v1".to_string()
+        } else {
+            config.embed_base_url.clone()
+        };
+        // 本地服务无鉴权：传空 key，request_embedding 检测到空值即不发送头。
+        Self::new(
+            &base_url,
+            "",
+            &config.embed_model,
+            config.embed_timeout_secs,
+        )
+    }
+
     /// 单条文本的真实 HTTP 请求：POST `/embeddings`、解析首个向量。
     /// 仅做网络往返，不含 runtime 管理——同步路径在共享 runtime 上 `block_on`，
     /// 异步路径由调用方直接 await。
     async fn request_embedding(&self, text: &str) -> Result<Vec<f32>, DeepseeknovaError> {
         let url = format!("{}/embeddings", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
+        let mut req = self.client.post(&url);
+        // 本地后端（Ollama）无鉴权：空 key 时不发 Authorization 头。
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req
             .json(&serde_json::json!({"model": self.model, "input": text}))
             .send()
             .await
@@ -188,6 +224,13 @@ pub fn try_memory_embedder(config: &MemoryConfig) -> Option<Arc<dyn EmbeddingPro
     match config.embedder.as_str() {
         "none" => None,
         "remote" => match RemoteEmbedder::from_memory_config(config) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(err) => {
+                tracing::warn!("memory semantic embeddings disabled: {err:#}");
+                None
+            }
+        },
+        "local" | "ollama" => match RemoteEmbedder::from_ollama_config(config) {
             Ok(e) => Some(Arc::new(e)),
             Err(err) => {
                 tracing::warn!("memory semantic embeddings disabled: {err:#}");
@@ -451,6 +494,50 @@ mod tests {
     }
 
     #[test]
+    fn from_ollama_config_defaults_to_ollama_and_skips_auth() {
+        let _g = ENV_LOCK.blocking_lock();
+        clear_proxy_env();
+        // 显式移除两个 key env，证明 local/ollama 不依赖任何 key。
+        let prev_embed = env::var(EMBED_API_KEY_ENV).ok();
+        let prev_openai = env::var(FALLBACK_API_KEY_ENV).ok();
+        env::remove_var(EMBED_API_KEY_ENV);
+        env::remove_var(FALLBACK_API_KEY_ENV);
+
+        // embedder=local + embed_model 非空 → 装配成功，base_url 回落 Ollama。
+        let cfg = config_with_embedder("local", "qwen3-embedding:0.6b");
+        let e = RemoteEmbedder::from_ollama_config(&cfg).unwrap();
+        assert_eq!(e.base_url, "http://localhost:11434/v1");
+        assert_eq!(e.api_key, "", "本地后端应无 key");
+
+        // embedder=ollama 同样装配成功。
+        let cfg2 = config_with_embedder("ollama", "qwen3-embedding:0.6b");
+        assert!(RemoteEmbedder::from_ollama_config(&cfg2).is_ok());
+
+        // 显式 base_url 应被保留（非 Ollama 默认，仍由调用方自行决定）。
+        let toml = "[memory]\nembedder = \"local\"\nembed_model = \"m\"\nembed_base_url = \"http://127.0.0.1:9999/v1\"\n";
+        let cfg3: deepseeknova_config::Config = toml::from_str(toml).unwrap();
+        let e3 = RemoteEmbedder::from_ollama_config(&cfg3.memory).unwrap();
+        assert_eq!(e3.base_url, "http://127.0.0.1:9999/v1");
+
+        // 非 local/ollama 必须拒绝。
+        let remote = config_with_embedder("remote", "m");
+        assert!(RemoteEmbedder::from_ollama_config(&remote).is_err());
+
+        // 空 model 必须报错。
+        let empty = config_with_embedder("local", "");
+        assert!(RemoteEmbedder::from_ollama_config(&empty).is_err());
+
+        match prev_embed {
+            Some(v) => env::set_var(EMBED_API_KEY_ENV, v),
+            None => env::remove_var(EMBED_API_KEY_ENV),
+        }
+        match prev_openai {
+            Some(v) => env::set_var(FALLBACK_API_KEY_ENV, v),
+            None => env::remove_var(FALLBACK_API_KEY_ENV),
+        }
+    }
+
+    #[test]
     fn try_memory_embedder_returns_none_when_disabled_or_missing_key() {
         let _g = ENV_LOCK.blocking_lock();
         clear_proxy_env();
@@ -461,8 +548,20 @@ mod tests {
 
         assert!(try_memory_embedder(&config_with_embedder("none", "")).is_none());
         assert!(
+            try_memory_embedder(&config_with_embedder("bogus", "")).is_none(),
+            "未知后端必须 fail-open 到 None"
+        );
+        // local/ollama：无 key 也要装配（本地无鉴权），仅缺 model 时 fail-open。
+        assert!(
             try_memory_embedder(&config_with_embedder("local", "")).is_none(),
-            "未实现后端必须 fail-open 到 None"
+            "local 缺 embed_model 必须 fail-open"
+        );
+        assert!(
+            try_memory_embedder(&config_with_embedder("local", "qwen3-embedding:0.6b")).is_some()
+        );
+        assert!(
+            try_memory_embedder(&config_with_embedder("ollama", "qwen3-embedding:0.6b")).is_some(),
+            "ollama 应装配（无 key，默认指向 Ollama）"
         );
         let remote = config_with_embedder("remote", "text-embedding-3-small");
         assert!(
