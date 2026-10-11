@@ -1591,6 +1591,7 @@ mod tests {
             reasoning_tokens: 0,
             cache_hit_tokens: 0,
             cache_miss_tokens: 0,
+            cache_write_tokens: 0,
         }));
         app.apply_run_event(RunEvent::TextDelta("hi".into()));
         app.apply_run_event(RunEvent::Done(done_output("")));
@@ -1608,6 +1609,7 @@ mod tests {
             reasoning_tokens: 0,
             cache_hit_tokens: hit,
             cache_miss_tokens: miss,
+            cache_write_tokens: 0,
         };
         app.apply_run_event(RunEvent::Usage(mk_usage(100, 40)));
         app.apply_run_event(RunEvent::Usage(mk_usage(30, 0)));
@@ -1631,6 +1633,7 @@ mod tests {
             reasoning_tokens: 12,
             cache_hit_tokens: 80,
             cache_miss_tokens: 20,
+            cache_write_tokens: 0,
         }));
         app.apply_run_event(RunEvent::ToolCallStart {
             id: "c1".into(),

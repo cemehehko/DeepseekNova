@@ -1670,6 +1670,7 @@ async fn build_agent_wires_cost_budget_pausing_on_exceeded_spend() {
             total_tokens: 1_000_000,
             cache_hit_tokens: 0,
             cache_miss_tokens: 1_000_000,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
         },
     );

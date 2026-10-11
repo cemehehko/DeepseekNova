@@ -974,6 +974,7 @@ mod tests {
                 reasoning_tokens: 20,
                 cache_hit_tokens: 0,
                 cache_miss_tokens: 0,
+                cache_write_tokens: 0,
             }),
             rendered_lines: 30,
             tr: Tr::new(crate::i18n::Lang::Zh),

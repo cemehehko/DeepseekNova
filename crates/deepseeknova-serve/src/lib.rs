@@ -1458,6 +1458,7 @@ mod tests {
             total_tokens: hit + miss,
             cache_hit_tokens: hit,
             cache_miss_tokens: miss,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
         };
         let v1 = usage_event_json(&usage(100, 40), &mut totals.borrow_mut());

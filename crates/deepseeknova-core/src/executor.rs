@@ -105,6 +105,7 @@ pub struct UsageAccumulator {
     total: AtomicU64,
     cache_hit: AtomicU64,
     cache_miss: AtomicU64,
+    cache_write: AtomicU64,
     reasoning: AtomicU64,
 }
 
@@ -121,6 +122,8 @@ impl UsageAccumulator {
             .fetch_add(u64::from(usage.cache_hit_tokens), Ordering::Relaxed);
         self.cache_miss
             .fetch_add(u64::from(usage.cache_miss_tokens), Ordering::Relaxed);
+        self.cache_write
+            .fetch_add(u64::from(usage.cache_write_tokens), Ordering::Relaxed);
         self.reasoning
             .fetch_add(u64::from(usage.reasoning_tokens), Ordering::Relaxed);
     }
@@ -136,6 +139,7 @@ impl UsageAccumulator {
             total_tokens: clamp(self.total.load(Ordering::Relaxed)),
             cache_hit_tokens: clamp(self.cache_hit.load(Ordering::Relaxed)),
             cache_miss_tokens: clamp(self.cache_miss.load(Ordering::Relaxed)),
+            cache_write_tokens: clamp(self.cache_write.load(Ordering::Relaxed)),
             reasoning_tokens: clamp(self.reasoning.load(Ordering::Relaxed)),
         }
     }
@@ -1098,6 +1102,7 @@ mod tests {
                     total_tokens: 14,
                     cache_hit_tokens: 6,
                     cache_miss_tokens: 4,
+                    cache_write_tokens: 0,
                     reasoning_tokens: 2,
                 },
             ))

@@ -326,13 +326,15 @@ impl Provider for OpenAIProvider {
         // so context-cache efficiency and billed reasoning tokens stay visible
         // even though this path returns only the message body.
         if let Some(ref u) = resp_body.usage {
+            let usage = u.to_usage();
             info!(
-                prompt_tokens = u.prompt_tokens,
-                completion_tokens = u.completion_tokens,
-                total_tokens = u.total_tokens,
-                cache_hit_tokens = u.cache_hit_tokens,
-                cache_miss_tokens = u.cache_miss_tokens,
-                reasoning_tokens = u.reasoning_tokens(),
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                total_tokens = usage.total_tokens,
+                cache_hit_tokens = usage.cache_hit_tokens,
+                cache_miss_tokens = usage.cache_miss_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                reasoning_tokens = usage.reasoning_tokens,
                 "deepseek usage (non-streaming generate)"
             );
         }
@@ -1101,8 +1103,9 @@ data: [DONE]
     }
 
     /// 不变量 3：provider 未上报缓存统计（usage 无 prompt_cache_hit_tokens /
-    /// miss_tokens 字段）时，两个计数都保持 0——调用方据此把 `cache_hit_rate`
-    /// 判为 `None`（「无记账」），而非误判成 0% 命中。
+    /// prompt_tokens_details 字段）时，hit=0 且 miss=prompt_tokens（整个前缀
+    /// 都按未命中计），`hit + miss == prompt` 恒等式保持——调用方据此能算出
+    /// 0% 命中率，而非把「无记账」误判为「有账但全命中/全未命中不明」。
     #[tokio::test]
     async fn parse_sse_usage_without_cache_fields_zeroes_counters() {
         let sse_data = r#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":40,"total_tokens":140,"completion_tokens_details":{"reasoning_tokens":25}}}
@@ -1139,9 +1142,53 @@ data: [DONE]
             "missing cache fields must yield 0 hit"
         );
         assert_eq!(
-            usage.cache_miss_tokens, 0,
-            "missing cache fields must yield 0 miss"
+            usage.cache_miss_tokens, 100,
+            "without an explicit miss field, the whole prompt counts as miss"
         );
+        assert_eq!(usage.cache_write_tokens, 0, "no cache_write reported");
+    }
+
+    /// OpenAI-style cache accounting: provod.ai reports `cached_tokens` under
+    /// `prompt_tokens_details`, NOT the DeepSeek `prompt_cache_hit_tokens`.
+    /// The mapping must surface it as `cache_hit_tokens` and derive miss from
+    /// the `hit + miss == prompt` identity.
+    #[tokio::test]
+    async fn parse_sse_openai_style_cached_tokens() {
+        let sse_data = r#"data: {"choices":[],"usage":{"prompt_tokens":622,"completion_tokens":158,"total_tokens":780,"prompt_tokens_details":{"cached_tokens":512,"cache_write_tokens":0},"completion_tokens_details":{"reasoning_tokens":152}}}
+
+data: [DONE]
+"#;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut tool_acc = Vec::new();
+        let mut sent_any = false;
+        let mut done_sent = false;
+        for line in sse_data.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            process_sse_line(trimmed, &tx, &mut tool_acc, &mut sent_any, &mut done_sent)
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("should emit a Chunk::Usage");
+        assert_eq!(usage.cache_hit_tokens, 512, "cached_tokens maps to hit");
+        assert_eq!(
+            usage.cache_miss_tokens, 110,
+            "miss derived as prompt - hit (622 - 512)"
+        );
+        assert_eq!(usage.cache_write_tokens, 0, "cache_write reported as 0");
     }
 
     /// Verify the final DeepSeek usage frame is parsed into a Chunk::Usage that

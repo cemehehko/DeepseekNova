@@ -339,6 +339,7 @@ mod tests {
             total_tokens: prompt + completion,
             cache_hit_tokens: cache_hit,
             cache_miss_tokens: prompt.saturating_sub(cache_hit),
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
         }
     }

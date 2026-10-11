@@ -534,6 +534,7 @@ mod tests {
                         completion_tokens: 1,
                         cache_hit_tokens: 0,
                         cache_miss_tokens: 0,
+                        cache_write_tokens: 0,
                         reasoning_tokens: 0,
                         total_tokens: 2,
                     }),

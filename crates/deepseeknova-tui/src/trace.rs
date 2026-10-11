@@ -260,6 +260,7 @@ pub enum RunEventTrace {
         reasoning_tokens: u32,
         cache_hit_tokens: u32,
         cache_miss_tokens: u32,
+        cache_write_tokens: u32,
     },
     /// Approval request surfaced to the user.
     ApprovalRequest {
@@ -319,6 +320,7 @@ impl From<deepseeknova_core::runner::RunEvent> for RunEventTrace {
                 reasoning_tokens: u.reasoning_tokens,
                 cache_hit_tokens: u.cache_hit_tokens,
                 cache_miss_tokens: u.cache_miss_tokens,
+                cache_write_tokens: u.cache_write_tokens,
             },
             RunEvent::ApprovalRequest {
                 id,

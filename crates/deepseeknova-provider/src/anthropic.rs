@@ -743,6 +743,7 @@ impl AnthropicUsage {
             total_tokens: prompt_tokens + self.output_tokens,
             cache_hit_tokens,
             cache_miss_tokens,
+            cache_write_tokens: self.cache_creation_input_tokens,
             reasoning_tokens: self
                 .output_tokens_details
                 .as_ref()
@@ -868,6 +869,7 @@ impl AnthropicUsageAcc {
             total_tokens: prompt_tokens + self.output_tokens,
             cache_hit_tokens,
             cache_miss_tokens,
+            cache_write_tokens: self.cache_creation,
             reasoning_tokens: self.reasoning_tokens,
         }
     }

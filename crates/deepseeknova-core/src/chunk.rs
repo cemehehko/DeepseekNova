@@ -16,6 +16,11 @@ pub struct Usage {
     pub cache_hit_tokens: u32,
     /// 未命中缓存的 token 数。
     pub cache_miss_tokens: u32,
+    /// 本次请求写入缓存（cache write/create）的 token 数。与 hit/miss 独立：
+    /// 冷查询会把前缀写入缓存（billed），命中率口径不受其影响。仅当 provider
+    /// 上报时非零（provod/OpenAI 的 `prompt_tokens_details.cache_write_tokens`）。
+    #[serde(default)]
+    pub cache_write_tokens: u32,
     /// 推理 token 数。
     pub reasoning_tokens: u32,
 }
