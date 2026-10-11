@@ -67,6 +67,12 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+# double_must_use：clippy 1.99 在 `async_trait::async_trait`（proc-macro）展开处
+# 误报——宏内部为返回类型 `Pin<Box<dyn Future>>` 生成 `#[must_use]`，而该类型
+# 本身已由 std 标记 `#[must_use]`，构成「重复 must_use」。源文件里 trait 方法
+# 并非手写 `#[must_use]`（如 runner.rs/tool.rs/recursion.rs 的裸 `#[async_trait]`），
+# 属代码生成侧 false-positive，非真实缺陷。workspace 级 allow 一次性豁免。
+double_must_use = "allow"
 
 [workspace.package]
 version = "0.6.0"

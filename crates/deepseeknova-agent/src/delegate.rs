@@ -1103,7 +1103,7 @@ mod tests {
             }
             let should_fail = self
                 .remaining_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
                     (r > 0).then(|| r - 1) // 惰性：r==0 时不计算 r-1（then_some 参数急切求值会溢出）
                 })
                 .is_ok();

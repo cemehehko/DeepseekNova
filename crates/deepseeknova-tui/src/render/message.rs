@@ -2320,10 +2320,9 @@ mod tests {
 
     /// Test 3: 没有 `+` 的段为 gray，有 `+` 的段为 text_secondary+bold
     ///（变体 A 语义：现有行为不变，仅修复 panic——`+` 键位极少出现）。
-    #[test]
-    /// Test 3: 分隔符样式为 gray_dim；无 `+` 前缀的段为 gray。
-    /// 当前 `has_key_prefix` 仅在前 3 字符判断 `+`（变体 A），
-    /// 实际 `Ctrl+P` 中 `+` 在第 4 位，故该段不会被加粗——行为同修前。
+    /// 分隔符样式为 gray_dim；无 `+` 前缀的段为 gray。当前 `has_key_prefix`
+    /// 仅在前 3 字符判断 `+`（变体 A），实际 `Ctrl+P` 中 `+` 在第 4 位，
+    /// 故该段不会被加粗——行为同修前。
     #[test]
     fn shortcuts_spans_styles() {
         let theme = Theme::default();

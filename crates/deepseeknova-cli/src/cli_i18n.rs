@@ -13,6 +13,11 @@ use crate::cli::Cli;
 // ═══════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// `HelpSubcommand` / `HelpFlag` / `VersionFlag` 是翻译表键：在 `en`/`ru`/`zh`
+// 中被 match 消费、在 `all_keys_have_translations` 测试中被构造，但生产路径上
+// clap 自动生成 help/version 参数（build() 前不可 `mut_arg`，见 `apply_root`），
+// 故这三个变体不在 prod 代码里被显式构建，触发 `dead_code`。
+#[allow(dead_code)]
 enum HelpKey {
     // ── 顶层 ──────────────────────────────────────
     About,
@@ -476,7 +481,10 @@ fn template(lang: Lang) -> &'static str {
     match lang {
         Lang::Ru => TEMPLATE_RU,
         Lang::Zh => TEMPLATE_ZH,
-        Lang::En => unreachable!(),
+        // En 使用 clap 内置默认模板，不覆写；`apply_common` 仅在 `lang !=
+        // Lang::En` 时调用本函数，此分支实际不可达。返回空串占位以消除
+        // `unreachable!`（生产代码 deny），并避免万一误调用时 panic。
+        Lang::En => "",
     }
 }
 
@@ -494,10 +502,8 @@ fn apply_common(cmd: Command, lang: Lang) -> Command {
             .subcommand_help_heading(tr(HelpKey::CommandsHeading, lang))
             .mut_args(|arg| {
                 let heading = arg.get_help_heading();
-                let arg = match heading {
-                    Some(h) if h == "Coordinator" => {
-                        arg.help_heading(tr(HelpKey::CoordinatorHeading, lang))
-                    }
+                match heading {
+                    Some("Coordinator") => arg.help_heading(tr(HelpKey::CoordinatorHeading, lang)),
                     None => {
                         let heading = if arg.is_positional() {
                             tr(HelpKey::ArgumentsHeading, lang)
@@ -507,8 +513,7 @@ fn apply_common(cmd: Command, lang: Lang) -> Command {
                         arg.help_heading(heading)
                     }
                     _ => arg,
-                };
-                arg
+                }
             })
     } else {
         cmd
@@ -799,7 +804,7 @@ mod tests {
     /// Проверяем, что локализованная команда валидна (без конфликтов).
     #[test]
     fn localized_cli_is_valid() {
-        for lang in [Lang::En] {
+        for lang in Lang::ALL {
             let cmd = localized_command(lang);
             cmd.debug_assert();
         }
@@ -953,7 +958,7 @@ mod tests {
     /// Убеждаемся, что `--help` корректно печатает локализованную справку.
     #[test]
     fn localized_help_does_not_panic() {
-        for lang in [Lang::En] {
+        for lang in Lang::ALL {
             let mut cmd = localized_command(lang);
             let err = cmd
                 .try_get_matches_from_mut(["deepseeknova", "--help"].iter())
