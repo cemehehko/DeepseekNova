@@ -515,6 +515,8 @@ pub struct TurnAccum {
     pub tools: HashMap<String, crate::trace::ToolStat>,
     /// 本轮错误次数（`AppEvent::Error` 计）。
     pub errors: u64,
+    /// 本轮循环守卫告警次数（`RunEvent::LoopWarning` 计）。
+    pub loop_warnings: u64,
     /// 暂停原因（`RunEvent::Paused` 写入；回合结束据此判定 outcome=Paused）。
     pub pause_reason: Option<String>,
 }
@@ -722,6 +724,7 @@ impl AppState {
                 result_bytes,
                 by_name: by_name.into_iter().collect(),
             },
+            loop_warnings: a.loop_warnings,
             cost,
         }
     }
@@ -866,6 +869,9 @@ impl AppState {
             }
             RunEvent::Paused { reason, .. } => {
                 self.turn_accum.pause_reason = Some(reason.clone());
+            }
+            RunEvent::LoopWarning { .. } => {
+                self.turn_accum.loop_warnings += 1;
             }
             _ => {}
         }

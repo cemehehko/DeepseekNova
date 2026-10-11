@@ -44,6 +44,11 @@ pub struct EvalCase {
     /// 成本上限（USD）：本用例全部轮次累计成本不得超过。
     #[serde(default)]
     pub cost_max: Option<f64>,
+    /// 前缀缓存命中率下限（0..1）：本用例跨轮次累计 `cache_hit_rate` 不得
+    /// 低于此值。仅对缓存端点生效（`None` 表示不启用此断言；与 `cost_max`
+    /// 并列，任一未达则该用例失败）。
+    #[serde(default)]
+    pub cache_hit_rate_min: Option<f64>,
     /// 重试轮次上限（默认 1 = 单轮；0 视为 1）。
     #[serde(default)]
     pub rounds: u32,
@@ -169,6 +174,23 @@ pub fn evaluate_case(case: &EvalCase, values: &CaseValues) -> Vec<CheckResult> {
                 kind: "cost",
                 description: desc,
                 actual: "成本不可用".to_string(),
+                passed: false,
+            }),
+        }
+    }
+    if let Some(threshold) = case.cache_hit_rate_min {
+        let desc = format!("cache_hit_rate >= {threshold:.2}");
+        match values.cache_hit_rate {
+            Some(actual) => checks.push(CheckResult {
+                kind: "cache_hit_rate",
+                description: desc,
+                actual: format!("{actual:.2}"),
+                passed: actual + 1e-3 >= threshold,
+            }),
+            None => checks.push(CheckResult {
+                kind: "cache_hit_rate",
+                description: desc,
+                actual: "无缓存记账".to_string(),
                 passed: false,
             }),
         }
@@ -585,6 +607,7 @@ mod tests {
             min_score: None,
             dimension_min: HashMap::new(),
             cost_max: None,
+            cache_hit_rate_min: None,
             rounds: 0,
         };
         let ok = evaluate_case(&case, &values("hello world", None, None));
@@ -604,6 +627,7 @@ mod tests {
             min_score: Some(4.0), // 0..5 分制
             dimension_min: HashMap::new(),
             cost_max: None,
+            cache_hit_rate_min: None,
             rounds: 0,
         };
         // composite 0.85 → 4.25/5 ≥ 4.0 ✓
@@ -648,6 +672,7 @@ mod tests {
                 ("协议".to_string(), 0.8),
             ]),
             cost_max: None,
+            cache_hit_rate_min: None,
             rounds: 0,
         };
         // 全部达标（governance 0.95 ≥ 0.9，协议 0.85 ≥ 0.8）。
@@ -676,6 +701,7 @@ mod tests {
             min_score: None,
             dimension_min: HashMap::new(),
             cost_max: Some(0.05),
+            cache_hit_rate_min: None,
             rounds: 0,
         };
         let pass = evaluate_case(&case, &values("", None, Some(0.032)));
@@ -688,6 +714,40 @@ mod tests {
         assert_eq!(noc[0].actual, "成本不可用");
     }
 
+    /// 缓存命中率下限（`cache_hit_rate_min`）：达阈值过、不足过、无记账 fail。
+    #[test]
+    fn cache_hit_rate_assertion_limits_and_unavailable() {
+        let case = EvalCase {
+            prompt: "p".into(),
+            name: None,
+            must_contain: vec![],
+            min_score: None,
+            dimension_min: HashMap::new(),
+            cost_max: None,
+            cache_hit_rate_min: Some(0.7),
+            rounds: 0,
+        };
+        let pass_v = CaseValues {
+            cache_hit_rate: Some(0.9),
+            ..CaseValues::default()
+        };
+        let pass = evaluate_case(&case, &pass_v);
+        assert_eq!(pass.len(), 1);
+        assert!(pass[0].passed, "{:?}", pass[0]);
+        assert_eq!(pass[0].kind, "cache_hit_rate");
+        // 不足阈值 → fail。
+        let fail_v = CaseValues {
+            cache_hit_rate: Some(0.2),
+            ..CaseValues::default()
+        };
+        assert!(!evaluate_case(&case, &fail_v)[0].passed);
+        // 无缓存记账 → fail 并说明原因。
+        let none_v = CaseValues::default();
+        let none = evaluate_case(&case, &none_v);
+        assert!(!none[0].passed);
+        assert_eq!(none[0].actual, "无缓存记账");
+    }
+
     #[test]
     fn multiple_assertions_and_semantics() {
         let case = EvalCase {
@@ -697,6 +757,7 @@ mod tests {
             min_score: Some(4.0),
             dimension_min: HashMap::from([("governance".to_string(), 0.9)]),
             cost_max: Some(0.05),
+            cache_hit_rate_min: None,
             rounds: 0,
         };
         let all_pass = evaluate_case(&case, &values("answer", Some(card(0.9, 0.95)), Some(0.03)));

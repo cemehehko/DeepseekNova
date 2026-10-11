@@ -176,7 +176,8 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 err.exit();
             }
         };
-        Cli::from_arg_matches_mut(&mut matches).expect("arg definition mismatch")
+        Cli::from_arg_matches_mut(&mut matches)
+            .map_err(|e| DeepseeknovaError::config(format!("arg definition mismatch: {e}")))?
     };
 
     // TUI 全屏模式（alternate screen）下 stdout 被 ratatui 独占，任何
@@ -851,6 +852,14 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 // 工作区上下文与权限门：子代理 runner 与 TUI 模式切换共享
                 // 同一实例（一次性构建，工厂内 clone）。
                 let workspace_root = std::env::current_dir().unwrap_or_default();
+                // E：从构建产物目录（target/release 等）启动时显式提示，避免
+                // 工具静默回退 bash 并烧干 step 配额。
+                if let Some(hint) =
+                    deepseeknova_security::path::detect_suspicious_workspace_root(&workspace_root)
+                {
+                    tracing::warn!(hint = %hint, "suspicious workspace root detected");
+                    eprintln!("warning: {hint}");
+                }
                 let security_ctx =
                     deepseeknova_runtime::build_security_context(&cfg, &workspace_root)?;
                 let permission_gate =

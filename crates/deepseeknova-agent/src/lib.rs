@@ -53,6 +53,8 @@ pub mod delegate;
 pub mod delegate_tool;
 pub mod diagnose;
 mod fetch_tool;
+/// 循环守卫：检测重复工具调用与无写进展停滞（测试场景定位用）。
+pub mod loop_guard;
 /// 对话历史内存管理（自动压缩、结果缓存与收缩）。
 pub mod memory;
 pub mod memory_distill;

@@ -3304,6 +3304,7 @@ async fn cancel_path_suppresses_diagnose_report() {
         Vec::new(), // 协议门控（阶段3）：空 = 关闭
         false,      // 对抗审查（阶段3）：关闭
         false,      // diff_audit（A4）：测试默认关
+        None,       // loop_guard（测试默认不启用）
     )
     .await;
     assert!(result.is_ok(), "cancel path must return Ok");
@@ -3586,5 +3587,164 @@ async fn failure_hook_not_fired_on_completed() {
     assert!(
         marker_text(&markers).is_empty(),
         "成功完成不得触发 failure 事件"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 循环守卫（loop_guard）集成测试
+// ---------------------------------------------------------------------------
+
+/// 多次重复同一读工具的响应序列：3 个相同 read_file ToolCall，再一段文本。
+fn repeat_read_chunks(n: usize, final_text: &str) -> Vec<Vec<Chunk>> {
+    let mut turns: Vec<Vec<Chunk>> = (0..n)
+        .map(|i| {
+            vec![
+                Chunk::ToolCallStart {
+                    id: format!("r{i}"),
+                    name: "read_file".into(),
+                },
+                Chunk::ToolCallEnd {
+                    id: format!("r{i}"),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/main.rs"}"#.into(),
+                },
+                Chunk::Done,
+            ]
+        })
+        .collect();
+    turns.push(vec![
+        Chunk::TextDelta(final_text.into()),
+        Chunk::Usage(Usage::default()),
+        Chunk::Done,
+    ]);
+    turns
+}
+
+/// 循环守卫：同一 `read_file` 连续重复达阈值 → 流中出现 `RunEvent::LoopWarning`。
+#[tokio::test]
+async fn loop_guard_emits_loop_warning_on_repeated_read() {
+    use crate::loop_guard::LoopGuardSettings;
+    let provider = Arc::new(MockProvider::sequential(repeat_read_chunks(4, "done")));
+    let settings = LoopGuardSettings {
+        enabled: true,
+        max_repeat_same_call: 3,
+        max_steps_without_progress: 100, // 只测重复分支
+        progress_tools: vec![],
+    };
+    let mut agent = Agent::new(provider, 6);
+    agent.register_tool(Arc::new(SpyTool {
+        name: "read_file",
+        result: "content".into(),
+    }));
+    // 注意：with_loop_guard 需在 run 前设置；builder 消费 self。
+    let agent = agent.with_loop_guard(settings);
+
+    let events = drain(agent, "read that file").await;
+    let warnings: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            RunEvent::LoopWarning {
+                tool,
+                repeats,
+                hint,
+            } => Some((tool.clone(), *repeats, hint.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !warnings.is_empty(),
+        "continuous repeated read must produce LoopWarning, events: {events:?}"
+    );
+    assert!(warnings.iter().any(|(t, _, _)| t == "read_file"));
+    assert!(warnings.iter().any(|(_, n, _)| *n >= 3));
+}
+
+/// 循环守卫：出现写工具（进展）后，不应有重复读告警（进展重置重复/停滞）。
+#[tokio::test]
+async fn loop_guard_no_warning_when_progress_made() {
+    use crate::loop_guard::LoopGuardSettings;
+    // 一次 write_file 进展工具 → 重置；随后只读一次 → 不触发重复阈值的告警。
+    let provider = Arc::new(MockProvider::sequential(vec![
+        vec![
+            Chunk::ToolCallStart {
+                id: "r1".into(),
+                name: "read_file".into(),
+            },
+            Chunk::ToolCallEnd {
+                id: "r1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/main.rs"}"#.into(),
+            },
+            Chunk::Done,
+        ],
+        vec![
+            Chunk::ToolCallStart {
+                id: "w1".into(),
+                name: "write_file".into(),
+            },
+            Chunk::ToolCallEnd {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"src/main.rs","content":"x"}"#.into(),
+            },
+            Chunk::Done,
+        ],
+        vec![
+            Chunk::TextDelta("done".into()),
+            Chunk::Usage(Usage::default()),
+            Chunk::Done,
+        ],
+    ]));
+    let settings = LoopGuardSettings {
+        enabled: true,
+        max_repeat_same_call: 2,
+        max_steps_without_progress: 100,
+        progress_tools: vec![],
+    };
+    let mut agent = Agent::new(provider, 6);
+    agent.register_tool(Arc::new(SpyTool {
+        name: "read_file",
+        result: "content".into(),
+    }));
+    agent.register_tool(Arc::new(SpyTool {
+        name: "write_file",
+        result: "written".into(),
+    }));
+    let agent = agent.with_loop_guard(settings);
+
+    let events = drain(agent, "read then write").await;
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, RunEvent::LoopWarning { .. }))
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "write progress must suppress loop warnings, events: {events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(e, RunEvent::Done(_))));
+}
+
+/// 循环守卫：`enabled=false` 时即使大量重复也不产生告警。
+#[tokio::test]
+async fn loop_guard_disabled_never_emits_warning() {
+    use crate::loop_guard::LoopGuardSettings;
+    let provider = Arc::new(MockProvider::sequential(repeat_read_chunks(4, "done")));
+    let settings = LoopGuardSettings {
+        enabled: false,
+        ..LoopGuardSettings::default()
+    };
+    let mut agent = Agent::new(provider, 6);
+    agent.register_tool(Arc::new(SpyTool {
+        name: "read_file",
+        result: "content".into(),
+    }));
+    let agent = agent.with_loop_guard(settings);
+
+    let events = drain(agent, "read").await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RunEvent::LoopWarning { .. })),
+        "disabled guard must not emit warnings"
     );
 }

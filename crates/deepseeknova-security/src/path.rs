@@ -89,6 +89,38 @@ pub fn secure_resolve(root: &Path, input: &Path) -> Result<PathBuf, Deepseeknova
     Ok(normalized)
 }
 
+/// 检测「工作区根目录疑似错误」：当前工作目录是否是 `target/` 之类的构建
+/// 产物子目录（如 `target/release`），这类目录里运行工具会因 `path escapes
+/// workspace root` 大量失败，agent 被迫回退 `bash sed/cat` 并烧干 step 配额。
+///
+/// 返回 `Some(hint)` 表示疑似误设（附提示文案），`None` 表示正常。纯启发式，
+/// 不阻断（`target` 作为合法 workspace 的场景少，但存在——如独立前端目标）。
+pub fn detect_suspicious_workspace_root(cwd: &Path) -> Option<String> {
+    let file_name = cwd.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    // `release`/`debug`/`bench`/`deps` 等 cargo 产物目录通常嵌套在 target 下。
+    let looks_like_build_out = matches!(
+        file_name,
+        "release" | "debug" | "bench" | "deps" | "build" | "incremental"
+    );
+    if !looks_like_build_out {
+        return None;
+    }
+    // 只有父目录名也为 `target`（或其下级）时才判定为「从构建产物目录启动」。
+    let parent_is_target = cwd
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|p| p == "target");
+    if !parent_is_target {
+        return None;
+    }
+    Some(format!(
+        "当前工作目录是构建产物目录 `{}`，可能导致文件工具报 `path escapes workspace root` \
+         并回退到低效的 bash 命令。请从项目根目录启动。",
+        cwd.display()
+    ))
+}
+
 /// Basic path sanitization: reject obviously malicious paths
 /// and ensure the path stays within the workspace root.
 pub fn sanitize_path(workspace: &Path, raw: &str) -> Result<PathBuf, DeepseeknovaError> {
@@ -104,6 +136,28 @@ pub fn sanitize_path(workspace: &Path, raw: &str) -> Result<PathBuf, Deepseeknov
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── detect_suspicious_workspace_root ──────────────────────────
+
+    #[test]
+    fn detects_build_output_directory() {
+        assert!(
+            detect_suspicious_workspace_root(Path::new("/proj/target/release")).is_some(),
+            "target/release 应被判为疑似误设工作区"
+        );
+        assert!(
+            detect_suspicious_workspace_root(Path::new("/proj/target/debug")).is_some(),
+            "target/debug 应被判为疑似误设工作区"
+        );
+    }
+
+    #[test]
+    fn ignores_normal_workspace_roots() {
+        assert!(detect_suspicious_workspace_root(Path::new("/proj")).is_none());
+        assert!(detect_suspicious_workspace_root(Path::new("/proj/src")).is_none());
+        // release 目录名但父级不是 target → 不误判。
+        assert!(detect_suspicious_workspace_root(Path::new("/proj/release")).is_none());
+    }
 
     // ── normalize_path ───────────────────────────────────────────
 

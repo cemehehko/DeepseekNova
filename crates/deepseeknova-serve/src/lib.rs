@@ -869,6 +869,14 @@ fn map_run_event(
         Ok(RunEvent::DriftFinding(drift)) => Some(Ok(Event::default()
             .event("drift_finding")
             .data(serde_json::to_string(&drift).unwrap_or_default()))),
+        // 循环守卫告警：透传 tool/repeats/hint。
+        Ok(RunEvent::LoopWarning {
+            tool,
+            repeats,
+            hint,
+        }) => Some(Ok(Event::default().event("loop_warning").data(
+            serde_json::json!({ "tool": tool, "repeats": repeats, "hint": hint }).to_string(),
+        ))),
         Err(e) => {
             let text = e.to_string();
             *failed = Some(text.clone());

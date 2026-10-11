@@ -209,6 +209,7 @@ pub(crate) async fn run_agent_loop(
     protocol_gates: Vec<Arc<dyn PhaseGate>>,
     adversarial_review_enabled: bool,
     diff_audit: bool,
+    loop_guard_settings: Option<crate::loop_guard::LoopGuardSettings>,
 ) -> Result<(), DeepseeknovaError> {
     // serve 等共享 Agent 场景未配置会话标注：每次 run 生成唯一 id，避免
     // 多会话共用同一 Paused session_id / 诊断报告文件名互相覆盖。
@@ -257,6 +258,9 @@ pub(crate) async fn run_agent_loop(
 
     // 会话级 L3 压缩器（持有熔断状态，跨 step 复用）。
     let mut l3 = crate::compaction::L3Compactor::new();
+    // 循环守卫：检测重复工具调用 / 无写进展停滞（跨 step 复用状态）。
+    let loop_settings = loop_guard_settings.unwrap_or_default();
+    let mut loop_guard = crate::loop_guard::LoopGuard::new(&loop_settings);
     // P2.3 会话内只读工具结果缓存（写执行后整体失效）。
     let mut tool_cache_map: HashMap<u64, String> = HashMap::new();
     // 会话效能采集（局部 tracker，run 隔离）。
@@ -679,6 +683,8 @@ pub(crate) async fn run_agent_loop(
             // （压缩路径已在修改后重新快照）。
             &snapshot,
             diff_audit,
+            &mut loop_guard,
+            &loop_settings,
         )
         .await?;
 
@@ -1338,6 +1344,9 @@ async fn stream_and_process_turn(
     // provider 请求复用此快照，不再在步内重复全量克隆。
     messages: &[Message],
     diff_audit: bool,
+    // 循环守卫状态与配置（跨 step 复用；在此观察 ToolCallEnd）。
+    loop_guard: &mut crate::loop_guard::LoopGuard,
+    loop_settings: &crate::loop_guard::LoopGuardSettings,
 ) -> Result<StepOutcome, DeepseeknovaError> {
     // Build tool refs for provider
     let tool_refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
@@ -1429,11 +1438,21 @@ async fn stream_and_process_turn(
                 }
                 tx.send(Ok(RunEvent::ToolCallEnd {
                     id,
-                    name,
-                    arguments,
+                    name: name.clone(),
+                    arguments: arguments.clone(),
                 }))
                 .await
                 .ok();
+                // 循环守卫：观察本次工具调用。
+                if let Some(w) = loop_guard.observe(loop_settings, &name, &arguments) {
+                    tx.send(Ok(RunEvent::LoopWarning {
+                        tool: w.tool,
+                        repeats: w.repeats,
+                        hint: w.hint,
+                    }))
+                    .await
+                    .ok();
+                }
             }
             Chunk::Usage(u) => {
                 tx.send(Ok(RunEvent::Usage(u.clone()))).await.ok();
@@ -2717,6 +2736,7 @@ mod tests {
             Vec::new(),
             false,
             false, // diff_audit：测试默认关
+            None,  // loop_guard：测试默认不启用
         )
         .await;
     }

@@ -1100,6 +1100,50 @@ data: [DONE]
         assert!(has_text, "should parse content as TextDelta");
     }
 
+    /// 不变量 3：provider 未上报缓存统计（usage 无 prompt_cache_hit_tokens /
+    /// miss_tokens 字段）时，两个计数都保持 0——调用方据此把 `cache_hit_rate`
+    /// 判为 `None`（「无记账」），而非误判成 0% 命中。
+    #[tokio::test]
+    async fn parse_sse_usage_without_cache_fields_zeroes_counters() {
+        let sse_data = r#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":40,"total_tokens":140,"completion_tokens_details":{"reasoning_tokens":25}}}
+
+data: [DONE]
+"#;
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut tool_acc = Vec::new();
+        let mut sent_any = false;
+        let mut done_sent = false;
+        for line in sse_data.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            process_sse_line(trimmed, &tx, &mut tool_acc, &mut sent_any, &mut done_sent)
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("should emit a Chunk::Usage");
+        assert_eq!(
+            usage.cache_hit_tokens, 0,
+            "missing cache fields must yield 0 hit"
+        );
+        assert_eq!(
+            usage.cache_miss_tokens, 0,
+            "missing cache fields must yield 0 miss"
+        );
+    }
+
     /// Verify the final DeepSeek usage frame is parsed into a Chunk::Usage that
     /// preserves context-cache hit/miss tokens AND the billed reasoning tokens
     /// nested under `completion_tokens_details`.
@@ -1479,5 +1523,78 @@ data: [DONE]
             "已产出内容后的断流必须上抛错误，不能重试导致重复输出"
         );
         std::env::remove_var("DEEPSEEK_API_KEY");
+    }
+
+    /// C3 diagnostic：确认两条前缀构建路径（`CacheAwarePromptBuilder::build_prefix`
+    /// 与 `OpenAIProvider::build_request`）在「system + tool schema」段上是字节级
+    /// 一致的 —— 这是 DeepSeek-V4 前缀缓存命中的前提。
+    ///
+    /// 事实链（读码确认）：
+    /// - agent 主路径用 `build_prefix(system, &[], None, repo_map)` 构造 `messages[0]`，
+    ///   工具传空（provider 层负责 schema 注入）。
+    /// - `build_request` 把 tool schema 序列化为 `req["tools"]`，**独立于** `messages`
+    ///   数组；OpenAI 端点语义上把 `tools` 视为与 system 并列的稳定段。
+    /// - 因此只要 `messages[0]`（system 前缀）在两个请求间字节一致、且 `tools`
+    ///   段由工具集身份缓存（同名/同 schema 不重排），前缀缓存即可命中。
+    #[test]
+    fn cache_prefix_system_bytes_and_tools_are_stable_across_requests() {
+        std::env::set_var("DPNOVA_PREFIX_KEY", "sk-test");
+        let provider = OpenAIProvider::new(
+            "https://api.deepseek.com",
+            "deepseek-v4-flash",
+            "DPNOVA_PREFIX_KEY",
+            30,
+            0,
+        )
+        .unwrap();
+
+        // 1. `messages[0]` 字节级稳定：同一 system_prompt + repo_map 在两次
+        //    `build_prefix` 中产出相同 hash（与 agent 主路径一致，tools 传空）。
+        let mut b1 = deepseeknova_context::CacheAwarePromptBuilder::new(false);
+        let mut b2 = deepseeknova_context::CacheAwarePromptBuilder::new(false);
+        let (prefix_a, hash_a) = b1.build_prefix("SYSTEM_PROMPT", &[], None, Some("MAP"));
+        let (prefix_b, hash_b) = b2.build_prefix("SYSTEM_PROMPT", &[], None, Some("MAP"));
+        assert_eq!(
+            prefix_a.as_bytes(),
+            prefix_b.as_bytes(),
+            "system 前缀字节必须稳定"
+        );
+        assert_eq!(hash_a, hash_b, "system 前缀 hash 必须稳定");
+
+        // 2. tools 段由工具集身份缓存：同名工具集在两次 `build_request` 中产出
+        //    相同 `req["tools"]` 字节（工具集不变 → tools 段不变 → 前缀稳定）。
+        // system-前缀在真实路径中由 agent 推入 messages[0]，此处复现该布局。
+        let sys_msg = Message {
+            role: deepseeknova_core::Role::System,
+            content: prefix_a,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let tool_a = NoopTool;
+        let set1: Vec<&dyn Tool> = vec![&tool_a];
+        let set2: Vec<&dyn Tool> = vec![&tool_a];
+        let msgs1 = [sys_msg.clone(), user_msg("first")];
+        let msgs2 = [sys_msg, user_msg("second")];
+        let req1 = provider.build_request(&msgs1, &set1, false);
+        let req2 = provider.build_request(&msgs2, &set2, false);
+        let tools1 = req1["tools"].to_string();
+        let tools2 = req2["tools"].to_string();
+        assert_eq!(tools1, tools2, "tools 段在工具集不变时必须字节一致");
+
+        // 3. 跨请求唯一允许变化的只有 volatile suffix（messages 尾部），
+        //    `tools` 段与 `messages[0]`（system 前缀）都必须保持不变。
+        assert_eq!(
+            req1["messages"][0]["role"], "system",
+            "首条消息必须是 system"
+        );
+        assert_eq!(
+            req1["messages"][0]["content"], req2["messages"][0]["content"],
+            "system 前缀在两次请求间必须字节一致"
+        );
+        std::env::remove_var("DPNOVA_PREFIX_KEY");
     }
 }

@@ -162,6 +162,15 @@ pub enum RunEvent {
     },
     /// 本次执行的 token 用量。
     Usage(Usage),
+    /// 循环守卫告警：检测到同一工具调用重复执行或长时间无写进展。
+    LoopWarning {
+        /// 触发告警的工具名。
+        tool: String,
+        /// 连续重复次数（或连续无进展 step 数）。
+        repeats: u64,
+        /// 人类可读提示。
+        hint: String,
+    },
     /// 一个对话轮次完成。
     TurnComplete,
     /// 请求用户审批一次待执行的工具调用。
@@ -267,6 +276,15 @@ pub enum WireEvent {
         passed: bool,
         /// 结果摘要。
         summary: String,
+    },
+    /// 循环守卫告警。
+    LoopWarning {
+        /// 触发告警的工具名。
+        tool: String,
+        /// 连续重复次数（或连续无进展 step 数）。
+        repeats: u64,
+        /// 人类可读提示。
+        hint: String,
     },
     /// 本次执行的 token 用量。
     Usage {
@@ -408,6 +426,15 @@ impl From<RunEvent> for WireEvent {
                 command,
                 passed,
                 summary,
+            },
+            RunEvent::LoopWarning {
+                tool,
+                repeats,
+                hint,
+            } => WireEvent::LoopWarning {
+                tool,
+                repeats,
+                hint,
             },
             RunEvent::Usage(u) => {
                 let usage_info: WireUsageInfo = u.into();

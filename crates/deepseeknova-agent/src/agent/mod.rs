@@ -201,6 +201,10 @@ pub struct Agent {
     /// A4：写后 diff 规模审计开关（git 仓库内，变更行数超阈值告警注入
     /// ToolResult）；默认关闭（零配置行为不变）。
     diff_audit: bool,
+
+    /// 循环守卫配置（`None` = 使用 [`crate::loop_guard::LoopGuardSettings::default`]；
+    /// 由 runtime 从 `config.loop_guard` 装配）。
+    loop_guard_settings: Option<crate::loop_guard::LoopGuardSettings>,
 }
 
 /// Type-erased provider that yields the current repo-map text (or `None`)
@@ -513,6 +517,7 @@ impl Agent {
             protocol_gates: Vec::new(),
             adversarial_review: false,
             diff_audit: false,
+            loop_guard_settings: None,
         }
     }
 
@@ -806,6 +811,14 @@ impl Agent {
         self
     }
 
+    /// 配置循环守卫（检测重复工具调用 / 无写进展停滞）。`None` = 默认
+    /// 设置；传入 `settings` 时按其阈值与进展工具集合运行。由 runtime 从
+    /// `config.loop_guard` 装配。
+    pub fn with_loop_guard(mut self, settings: crate::loop_guard::LoopGuardSettings) -> Self {
+        self.loop_guard_settings = Some(settings);
+        self
+    }
+
     /// 注册失败诊断回调（任务质量闭环 B 阶段）。每次 `run_stream` 以非
     /// success 结束（Paused/failed）时调用一次，传入结构化
     /// [`crate::diagnose::DiagnoseReport`]（阶段分解 + 时序 + 失败详情 +
@@ -1063,6 +1076,8 @@ impl Agent {
         let adversarial_review_enabled = self.adversarial_review;
         // A4：写后 diff 审计开关复制为局部值（spawn 内借用 self 会逃逸）。
         let diff_audit = self.diff_audit;
+        // 循环守卫配置复制为局部值（spawn 内借用 self 会逃逸）。
+        let loop_guard_settings = self.loop_guard_settings.clone();
 
         tokio::spawn(async move {
             // 共享内存：fetch_full_result 工具按需取回被截断的完整结果。
@@ -1231,6 +1246,7 @@ impl Agent {
                 protocol_gates,
                 adversarial_review_enabled,
                 diff_audit,
+                loop_guard_settings,
             )
             .await;
 

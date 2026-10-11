@@ -229,6 +229,22 @@ impl ConversationApply for Conversation {
                     ),
                 });
             }
+            // 循环守卫告警：以信息系统段呈现。
+            RunEvent::LoopWarning {
+                tool,
+                repeats,
+                hint,
+            } => {
+                let Some(turn) = self.current_mut() else {
+                    return;
+                };
+                turn.assistant.flush_text();
+                turn.assistant.flush_reasoning();
+                turn.assistant.segments.push(Segment::System {
+                    kind: SystemKind::Info,
+                    text: format!("↻ loop guard: {tool} ×{repeats} — {hint}"),
+                });
+            }
             RunEvent::TurnComplete => {
                 if let Some(turn) = self.current_mut() {
                     turn.assistant.flush_all();

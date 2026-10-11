@@ -907,6 +907,14 @@ pub fn build_agent_with_role_providers(
         );
     }
 
+    // ── 循环守卫（检测重复工具调用 / 无写进展停滞；默认开启，保守阈值）──
+    agent = agent.with_loop_guard(deepseeknova_agent::loop_guard::LoopGuardSettings {
+        enabled: config.loop_guard.enabled,
+        max_repeat_same_call: config.loop_guard.max_repeat_same_call,
+        max_steps_without_progress: config.loop_guard.max_steps_without_progress,
+        progress_tools: config.loop_guard.progress_tools.clone(),
+    });
+
     // ── P1 并行工具执行 + 完成前确定性验证 ──
     agent = agent.with_concurrent_tools(config.agent.concurrent_tools);
     if config.verify.enabled && (!config.verify.commands.is_empty() || config.verify.llm) {

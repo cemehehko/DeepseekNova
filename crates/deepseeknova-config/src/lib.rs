@@ -152,6 +152,12 @@ pub struct Config {
     /// 默认关闭——关闭时装配层不挂载，Agent 零进程开销。
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// 循环守卫（`[loop_guard]` 段）：检测 agent 对同一工具调用的重复
+    /// 执行（「已理解却又重新读取」），以及长时间无写操作进展。默认开启，
+    /// 但阈值保守，不影响正常长任务。
+    #[serde(default)]
+    pub loop_guard: LoopGuardConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1911,82 @@ pub struct HookCommandConfig {
 }
 
 // ---------------------------------------------------------------------------
+// LoopGuard（循环守卫：检测重复工具调用与无写进展停滞）
+// ---------------------------------------------------------------------------
+
+/// `[loop_guard]` 段：检测 agent 对同一工具调用的重复执行与长时间无写
+/// 操作进展。默认开启，阈值保守，不影响正常长任务。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopGuardConfig {
+    /// 总开关（默认 true）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// 同一签名（工具 + 归一化参数）连续重复 N 次即告警（默认 3）。
+    #[serde(default = "default_loop_guard_repeat")]
+    pub max_repeat_same_call: usize,
+
+    /// 连续 N 个 step 未出现「进展工具」（write/edit 等）即告警（默认 8）。
+    #[serde(default = "default_loop_guard_stagnant")]
+    pub max_steps_without_progress: usize,
+
+    /// 视为「进展」的工具名集合；命中即重置停滞计数。缺省内置默认
+    /// 集合（write/edit 等），显式配置时整体替换。
+    #[serde(default)]
+    pub progress_tools: Vec<String>,
+}
+
+fn default_loop_guard_repeat() -> usize {
+    3
+}
+
+fn default_loop_guard_stagnant() -> usize {
+    8
+}
+
+impl Default for LoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_repeat_same_call: default_loop_guard_repeat(),
+            max_steps_without_progress: default_loop_guard_stagnant(),
+            progress_tools: Vec::new(),
+        }
+    }
+}
+
+/// 内置缺省的「进展」工具名（无显式配置时使用）。
+pub fn default_progress_tools() -> &'static [&'static str] {
+    &[
+        "write_file",
+        "edit_file",
+        "StrReplace",
+        "replace_in_file",
+        "create_file",
+    ]
+}
+
+impl LoopGuardConfig {
+    /// 深度合并 `[loop_guard]`：非默认值才覆盖；`progress_tools` 显式非空
+    /// 时整体替换（与 providers/models 的「显式列表替换」语义一致）。
+    fn merge(&mut self, other: LoopGuardConfig) {
+        let d = LoopGuardConfig::default();
+        if other.enabled != d.enabled {
+            self.enabled = other.enabled;
+        }
+        if other.max_repeat_same_call != d.max_repeat_same_call {
+            self.max_repeat_same_call = other.max_repeat_same_call;
+        }
+        if other.max_steps_without_progress != d.max_steps_without_progress {
+            self.max_steps_without_progress = other.max_steps_without_progress;
+        }
+        if !other.progress_tools.is_empty() {
+            self.progress_tools = other.progress_tools;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loading & merging
 // ---------------------------------------------------------------------------
 
@@ -2017,6 +2099,7 @@ impl Config {
         self.protocol.merge(other.protocol);
         self.hooks.merge(other.hooks);
         self.ui.merge(other.ui);
+        self.loop_guard.merge(other.loop_guard);
     }
 
     /// Apply DEEPSEEKNOVA_* environment variable overrides.

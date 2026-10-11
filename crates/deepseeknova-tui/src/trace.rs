@@ -119,6 +119,8 @@ pub struct TurnSummary {
     pub tokens: TurnTokenStats,
     /// Tool usage.
     pub tools: TurnToolStats,
+    /// Cycle-guard warnings surfaced this turn (`RunEvent::LoopWarning`).
+    pub loop_warnings: u64,
     /// Session-wide cumulative cost (from the ledger).
     pub cost: TurnCost,
 }
@@ -431,6 +433,7 @@ mod tests {
                     errors: 0,
                     tokens: TurnTokenStats::default(),
                     tools: TurnToolStats::default(),
+                    loop_warnings: 0,
                     cost: TurnCost::default(),
                 },
             },

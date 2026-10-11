@@ -111,4 +111,5 @@ bench-ci:
 eval-ci:
 	@test -n "$$DEEPSEEKNOVA_API_KEY" -o -n "$$DEEPSEEK_API_KEY" || { echo "跳过 eval-ci：未配置 LLM API key"; exit 0; }
 	cargo run --bin deepseeknova-cli -- eval --path evals/core.jsonl --format json \
-		--require-min-score 3.5 --require-dimension governance>=0.7
+		--require-min-score 3.5 --require-dimension governance>=0.7 \
+		--require-min-cache-hit-rate 0.5

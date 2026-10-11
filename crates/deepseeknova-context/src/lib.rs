@@ -1291,6 +1291,69 @@ mod tests {
         assert_ne!(h1, h3, "不同 map 的 prefix hash 必须变化");
     }
 
+    /// 不变量 1：`messages[0]`（system）字节级稳定——同一 system_prompt 重复
+    /// 构建 prefix 得相同 hash；「多一个空格」即破坏稳定（hash 变化）。
+    #[test]
+    fn cache_invariant1_system_byte_stable() {
+        let mut b1 = CacheAwarePromptBuilder::new(false);
+        let mut b2 = CacheAwarePromptBuilder::new(false);
+        let (_, h1) = b1.build_prefix("You are helpful.", &[], None, None);
+        let (_, h2) = b2.build_prefix("You are helpful.", &[], None, None);
+        assert_eq!(h1, h2, "同一 system_prompt 的 prefix hash 必须稳定");
+        // 多加一个空格 → hash 改变（捕获不稳定）。
+        let (_, h3) = b2.build_prefix("You are helpful. ", &[], None, None);
+        assert_ne!(h1, h3, "system_prompt 尾随空格必须改变 hash（缓存失效）");
+    }
+
+    /// 不变量 1 补充：实际请求的首个消息必须是 System，且含稳定前缀。
+    #[test]
+    fn cache_invariant1_first_message_is_system() {
+        let messages = PromptBuilder::build(
+            "You are helpful.",
+            &[],
+            &WorkingMemory::new(),
+            &ProjectMemory::new(),
+            None,
+        );
+        assert_eq!(messages[0].role, Role::System);
+        assert!(messages[0].content.contains("You are helpful."));
+    }
+
+    /// 不变量 2：累积历史——prefix 段（system 之后）不因后续消息追加而被
+    /// 重写。此处验证 `build_prefix` 的内容与 hash 在仅增加 conversation
+    /// 的情况下不变（前缀与 volatile conversation 解耦）。
+    #[test]
+    fn cache_invariant2_prefix_independent_of_conversation() {
+        let mut b = CacheAwarePromptBuilder::new(false);
+        let (prefix_a, hash_a) = b.build_prefix("SYS", &[], None, None);
+
+        // 追加对话消息不应改变前缀：build 只把 conversation 放 volatile 区。
+        let mut wm = WorkingMemory::new();
+        wm.add_message(Message {
+            role: Role::User,
+            content: "hello".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        });
+        let (_messages, hash_b) = CacheAwarePromptBuilder::new(false).build(
+            "SYS",
+            &[],
+            &ProjectMemory::new(),
+            None,
+            &wm.get_all(),
+            "hi",
+        );
+        assert_eq!(
+            hash_a, hash_b,
+            "conversation appends must not move the prefix hash"
+        );
+        let _ = prefix_a;
+    }
+
     #[test]
     fn cache_builder_none_map_still_hashes_stable() {
         // repo_map 为 None 时 hash 仍确定（不因缺 map 而产生非确定性）。

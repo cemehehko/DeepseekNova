@@ -469,6 +469,21 @@ where
                                  （本轮进度尚未写入磁盘，退出进程后不会出现在 --resume 中）"
                             );
                         }
+                        Ok(RunEvent::LoopWarning {
+                            tool,
+                            repeats,
+                            hint,
+                        }) => {
+                            if mode == DisplayMode::Raw {
+                                println!("[loop_warning] {tool} x{repeats}: {hint}");
+                            } else {
+                                tracing::warn!(
+                                    tool = %tool,
+                                    repeats = %repeats,
+                                    "loop guard: {hint}"
+                                );
+                            }
+                        }
                         Err(e) => {
                             if mode != DisplayMode::Raw {
                                 close_reasoning(&mut reasoning_open);
@@ -614,7 +629,7 @@ async fn handle_slash_command(
                         tr.t_args(
                             Key::ModelCurrent,
                             &[
-                                ("effort", &effort_label(*current_effort)),
+                                ("effort", effort_label(*current_effort)),
                                 ("model", model_str)
                             ]
                         )
