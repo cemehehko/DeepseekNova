@@ -944,7 +944,10 @@ impl AppState {
             None => h.candidates.len(),
         };
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            // 仅方向键选择：j/k 必须回落为字符输入——`/model thinking` 里的
+            // 'k'、`/jump` 的 'j'、`/checkpoint` 的 'k' 都被此前的 j/k 导航
+            // 吞掉，导致这些命令/参数根本打不全（浮层标题也只提示 ↑↓）。
+            KeyCode::Up => {
                 if let Some(hint) = &mut self.command_hint {
                     let n = select_len(hint);
                     if n > 0 {
@@ -953,7 +956,7 @@ impl AppState {
                 }
                 Some(KeyAction::None)
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some(hint) = &mut self.command_hint {
                     let n = select_len(hint);
                     if n > 0 {
@@ -1002,15 +1005,25 @@ impl AppState {
                 Some(KeyAction::None)
             }
             KeyCode::Tab => {
-                let picked = self
-                    .command_hint
-                    .as_ref()
-                    .and_then(|h| h.candidates.get(h.selected).map(|c| c.name));
-                if let Some(name) = picked {
-                    // 仅填入命令名 + 空格，让用户继续输入参数再回车。
-                    self.input.set_text(format!("/{name} "));
+                let hint = self.command_hint.take();
+                if let Some(h) = hint {
+                    let picked = h.candidates.get(h.selected).map(|c| c.name);
+                    // 参数模式：Tab 补全当前选中参数（`/model ` → `/model thinking `）。
+                    match h.arg_options.as_ref() {
+                        Some(opts) => {
+                            let opt = opts.get(h.selected).copied().unwrap_or_default();
+                            if let Some(name) = picked {
+                                self.input.set_text(format!("/{name} {opt} "));
+                            }
+                        }
+                        // 命令名模式：仅填入命令名 + 空格，让用户继续输入参数再回车。
+                        None => {
+                            if let Some(name) = picked {
+                                self.input.set_text(format!("/{name} "));
+                            }
+                        }
+                    }
                 }
-                self.command_hint = None;
                 Some(KeyAction::None)
             }
             KeyCode::Esc => {
@@ -1734,6 +1747,61 @@ mod tests {
         // Esc 关闭后不得被重建。
         app.handle_key(&key(KeyCode::Esc));
         assert!(app.command_hint.is_none(), "Esc 关闭且不被重建");
+    }
+
+    #[test]
+    fn command_hint_j_and_k_fall_through_as_text() {
+        // 回归：斜杠候选浮层打开时 j/k 曾是上下导航，导致 `/model thinking`
+        // 里的 'k'、`/jump` 的 'j'、`/checkpoint` 的 'k' 根本打不出来。
+        // 现在 j/k 必须回落为字符输入（选择仅用 ↑↓）。
+        let mut app = AppState::default();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        // 用户实测场景：`/model thinking` —— 参数里的 'thinking' 含 'k'，
+        // 且 'thi' 之后需按 Tab 补全（arg 模式）。'k'、'j' 必须能键入。
+        for c in "/model thinking".chars() {
+            app.handle_key(&key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input.text, "/model thinking", "'k' 不被导航吞掉");
+        // 浮层打开时 ↑↓ 依然是选择（用多命中的 `/s` 验证选择可用）。
+        let mut app2 = AppState::default();
+        app2.handle_key(&key(KeyCode::Char('/')));
+        app2.handle_key(&key(KeyCode::Char('s')));
+        assert!(app2.command_hint.is_some(), "/s 触发多命令候选");
+        app2.handle_key(&key(KeyCode::Down));
+        assert_eq!(app2.command_hint.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn command_hint_tab_completes_arg_in_arg_mode() {
+        // 回归：参数模式下 Tab 此前补全成命令名（`/model ` → `/model `），
+        // 用户按 Tab 想补 `thinking` 却得到空参数。现在 Tab 应补全选中参数。
+        let mut app = AppState::default();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        for c in "/model ".chars() {
+            app.handle_key(&key(KeyCode::Char(c)));
+        }
+        assert!(
+            app.command_hint
+                .as_ref()
+                .is_some_and(|h| h.arg_options.is_some()),
+            "/model  进入参数模式"
+        );
+        app.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            app.input.text, "/model effort <disabled|high|max> ",
+            "Tab 补全当前选中参数"
+        );
+        assert!(app.command_hint.is_none(), "补全后浮层关闭");
     }
 
     #[test]
