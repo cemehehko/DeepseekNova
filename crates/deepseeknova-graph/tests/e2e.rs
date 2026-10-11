@@ -101,7 +101,9 @@ fn e2e_refresh_search_trace_repomap_across_languages() {
         "repo_map 应含符号：{map}"
     );
 
-    // 大小写不敏感（经公开 API）
+    // 大小写不敏感（经公开 API）。注意：`up[0]` 验证的是 `search` 的
+    // exact-partition（精确名置顶），非 BM25 排序本身；ranking 竞争覆盖在
+    // store 层 fts_search_ranks_name_match（单候选下 [0] 会是 presence 假阳性）。
     let up = idx.search("PERMISSIONGATE", None, 10).unwrap();
     assert!(!up.is_empty() && up[0].name == "PermissionGate", "{up:?}");
 }

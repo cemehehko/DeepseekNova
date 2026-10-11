@@ -223,6 +223,157 @@ async fn build_agent_wires_graph_when_enabled() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A 补全：budget = 0 时 repo map provider 不装配 —— system prompt 不得出现
+/// `## Repo Map` 段（graph 仍启用，只是关掉 map 注入，保留检索工具）。
+#[tokio::test]
+async fn build_agent_repo_map_disabled_when_budget_zero() {
+    use futures::StreamExt;
+    use std::sync::Mutex;
+
+    let mut config = Config::default();
+    config.graph.enabled = true;
+    config.graph.repo_map_tokens = 0;
+    config.memory.enabled = false;
+
+    let root = std::env::temp_dir().join(format!("dnv-rmap0-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/marker.rs"), "pub fn marker_fn() {}\n").unwrap();
+
+    // 捕获 run 时 provider 收到的 system 消息，用于断言 map 段缺失。
+    struct CapturingProvider {
+        sys_seen: Arc<Mutex<String>>,
+    }
+    #[async_trait::async_trait]
+    impl deepseeknova_provider::Provider for CapturingProvider {
+        async fn generate(
+            &self,
+            v: deepseeknova_provider::ValidatedRequest<'_>,
+        ) -> Result<deepseeknova_core::Message, deepseeknova_core::DeepseeknovaError> {
+            if let Some(sys) = v
+                .messages
+                .iter()
+                .find(|m| m.role == deepseeknova_core::Role::System)
+            {
+                self.sys_seen.lock().unwrap().push_str(&sys.content);
+            }
+            Ok(deepseeknova_core::Message {
+                role: deepseeknova_core::Role::Assistant,
+                content: "ok".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                reasoning_signature: None,
+                usage: None,
+            })
+        }
+    }
+
+    let sys_seen = Arc::new(Mutex::new(String::new()));
+    let provider: Arc<dyn deepseeknova_provider::Provider> = Arc::new(CapturingProvider {
+        sys_seen: sys_seen.clone(),
+    });
+
+    let agent = build_agent(&config, root.clone(), provider.clone(), 2, None, vec![]).unwrap();
+
+    // 直接验证未装配 provider（避免依赖 run 时序）：预算 0 → provider 为空。
+    let mut stream = agent
+        .run_stream(deepseeknova_core::RunInput {
+            prompt: "does budget 0 skip map".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let sys = sys_seen.lock().unwrap();
+    assert!(
+        !sys.contains("## Repo Map"),
+        "budget=0 时 system prompt 不得含 Repo Map 段，实得: {sys}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A 补全：budget > 0 时 repo map provider 装配且真实调用 `idx.repo_map`，
+/// 符号名进入 system prompt 的 `## Repo Map` 段（经真实 GraphIndex 与
+/// run_stream 全链路，而非 mock provider）。
+#[tokio::test]
+async fn build_agent_injects_real_repo_map_into_system_prompt() {
+    use futures::StreamExt;
+    use std::sync::Mutex;
+
+    let mut config = Config::default();
+    config.graph.enabled = true;
+    config.graph.repo_map_tokens = 4096;
+    config.memory.enabled = false;
+
+    let root = std::env::temp_dir().join(format!("dnv-rmap1-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/marker.rs"),
+        "pub fn marker_fn() {}\npub fn helper_fn() {}\n",
+    )
+    .unwrap();
+
+    struct CapturingProvider {
+        sys_seen: Arc<Mutex<String>>,
+    }
+    #[async_trait::async_trait]
+    impl deepseeknova_provider::Provider for CapturingProvider {
+        async fn generate(
+            &self,
+            v: deepseeknova_provider::ValidatedRequest<'_>,
+        ) -> Result<deepseeknova_core::Message, deepseeknova_core::DeepseeknovaError> {
+            if let Some(sys) = v
+                .messages
+                .iter()
+                .find(|m| m.role == deepseeknova_core::Role::System)
+            {
+                self.sys_seen.lock().unwrap().push_str(&sys.content);
+            }
+            Ok(deepseeknova_core::Message {
+                role: deepseeknova_core::Role::Assistant,
+                content: "ok".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                reasoning_signature: None,
+                usage: None,
+            })
+        }
+    }
+
+    let sys_seen = Arc::new(Mutex::new(String::new()));
+    let provider: Arc<dyn deepseeknova_provider::Provider> = Arc::new(CapturingProvider {
+        sys_seen: sys_seen.clone(),
+    });
+
+    let agent = build_agent(&config, root.clone(), provider, 2, None, vec![]).unwrap();
+
+    let mut stream = agent
+        .run_stream(deepseeknova_core::RunInput {
+            prompt: "where is marker_fn".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let sys = sys_seen.lock().unwrap();
+    assert!(
+        sys.contains("## Repo Map"),
+        "budget>0 时 system prompt 应含 Repo Map 段"
+    );
+    assert!(
+        sys.contains("marker_fn"),
+        "repo map 应包含 workspace 符号 marker_fn，实得: {sys}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn build_agent_skips_graph_when_disabled() {
     let mut config = Config::default();

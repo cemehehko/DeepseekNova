@@ -47,6 +47,8 @@ fn self_index_finds_known_symbols() {
     // 成功标准 2：search_code("PermissionGate") 首位命中定义实体
     let hits = idx.search("PermissionGate", None, 10).expect("search");
     assert!(!hits.is_empty(), "PermissionGate should be found");
+    // 注：`hits[0]` 验证 exact-partition（精确名置顶），非 BM25 排序；真实仓
+    // 库存在同名竞争者时会退化，ranking 竞争覆盖在 store 层单测。
     assert_eq!(
         hits[0].name, "PermissionGate",
         "top hit should be the PermissionGate definition, got {}",

@@ -1751,6 +1751,21 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
+    /// 显式把文件 mtime 推到未来（+2s）：增量刷新的 mtime 判定依赖 seconds
+    /// 精度，sleep(1100ms) 在粗粒度 mtime 的 FS 上会 flaky；显式写 mtime 则
+    /// 与具体 FS 无关，保证下一次 refresh 必判「已变」。
+    fn bump_mtime(root: &std::path::Path, rel: &str) {
+        let p = root.join(rel);
+        let future = std::time::SystemTime::now()
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("system clock overflow");
+        // `set_modified` 是 1.75+ 的稳定 API；失败则回落到旧路径（不会 panic，
+        // 因为写入文件本身必然成功）。
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
+            let _ = f.set_modified(future);
+        }
+    }
+
     #[test]
     fn full_then_incremental_refresh() {
         let dir = tempdir().unwrap();
@@ -1772,8 +1787,8 @@ mod tests {
             .unwrap();
         assert!(callers.iter().any(|n| n.name == "alpha"));
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write(root, "src/b.rs", "pub fn gamma() {}\npub fn delta() {}\n");
+        bump_mtime(root, "src/b.rs");
         let n2 = store.refresh(root, 1_048_576).unwrap();
         assert_eq!(n2.files_reparsed, 1);
         assert_eq!(store.find_by_name("beta").unwrap()[0].id, beta_id);
@@ -1801,8 +1816,8 @@ mod tests {
         );
 
         // 只改 b.rs：在 beta 前插一个函数使 beta 行号后移（node id 变化）
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write(root, "src/b.rs", "pub fn prelude() {}\npub fn beta() {}\n");
+        bump_mtime(root, "src/b.rs");
         let r = store.refresh(root, 1_048_576).unwrap();
         assert_eq!(r.files_reparsed, 1, "only b.rs reparsed");
 
@@ -1832,7 +1847,6 @@ mod tests {
 
         // 删除 gone.rs 后刷新
         std::fs::remove_file(root.join("src/gone.rs")).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         store.refresh(root, 1_048_576).unwrap();
 
         assert!(
@@ -1847,17 +1861,33 @@ mod tests {
 
     #[test]
     fn fts_search_ranks_name_match() {
+        // 真实排序覆盖（不再是无竞争的 presence 断言）：
+        // 精确名（Data）与仅凭 token 匹配的竞争者（bar_data）同时命中查询
+        // "data"。bar_data 的 doc 高频出现 "data" 使其 BM25 更高，但
+        // `search` 的 exact-partition 必须把精确名 Data 置顶——这验证的是
+        // 「精确名置顶」真正压过 BM25 排序，而非单候选下的假阳性。
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
             root,
             "src/a.rs",
-            "/// permission gate\npub struct PermissionGate {}\npub fn unrelated() {}\n",
+            "pub struct Data {}\n\
+             /// data data data data\npub fn bar_data() {}\n\
+             pub fn unrelated() {}\n",
         );
         let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
         store.refresh(root, 1_048_576).unwrap();
-        let hits = store.search("PermissionGate", None, 10).unwrap();
-        assert_eq!(hits[0].name, "PermissionGate");
+        let hits = store.search("data", None, 10).unwrap();
+        let names: Vec<&str> = hits.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(hits[0].name, "Data", "精确名必须置顶：{names:?}");
+        assert!(
+            names.contains(&"bar_data"),
+            "token 命中必须被 FTS 召回：{names:?}"
+        );
+        assert!(
+            !names.contains(&"unrelated"),
+            "无 token 命中不得召回：{names:?}"
+        );
     }
 
     #[test]
@@ -1966,18 +1996,33 @@ mod tests {
             "查询 build 应命中 build_agent：{:?}",
             hits.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
-        // 边界：FTS 按整 token 匹配，"norm" 不是 "normalize" 的 token → 空。
-        // （≥3 字符的部分英文词不走 LIKE 回退，此为当前检索边界。）
+    }
+
+    #[test]
+    fn fts_partial_english_word_known_limitation() {
+        // 已知限制（не инвариант продукта）：FTS5 unicode61 按整 token 匹配，
+        // 故 ≥3 字符的部分英文词 "norm" 不会命中 "normalize"（不走 LIKE 回退，
+        // LIKE 仅用于 ≤2 字符短词）。**若未来切换到 ASCII-trigram 分词器，本
+        // 负断言将失效，需同步修改。**
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/n.rs", "pub fn normalize() {}\n");
+        let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
+        store.refresh(root, 1_048_576).unwrap();
+
         let empty = store.search("norm", None, 10).unwrap();
         assert!(
             empty.is_empty(),
-            "部分英文词（≥3 字符）不得经 FTS 命中：{:?}",
+            "部分英文词（≥3 字符）当前不得经 FTS 命中：{:?}",
             empty.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn fts_case_insensitive_query() {
+        // 本测试聚焦「大小写不敏感」：大写查询 PERMISSIONGATE 精确命中
+        // PermissionGate（exact-partition 用 eq_ignore_ascii_case）。ranking
+        // 竞争覆盖由 fts_search_ranks_name_match 承担，此处单候选即可。
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -1990,7 +2035,7 @@ mod tests {
 
         let hits = store.search("PERMISSIONGATE", None, 10).unwrap();
         assert_eq!(hits[0].name, "PermissionGate");
-        // 多词 + 大小写混用
+        // 多词 + 大小写混用（token 级大小写不敏感）
         let multi = store.search("PERMISSION gate", None, 10).unwrap();
         assert!(
             multi.iter().any(|n| n.name == "PermissionGate"),
@@ -2601,8 +2646,8 @@ require github.com/single/dep v1.0.0\n";
         );
 
         // 改 doc：旧 token 消失、新 token 可检索（FTS 行随文件增量同步）。
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write(root, "src/a.rs", "/// ferris beta\npub fn alpha_fn() {}\n");
+        bump_mtime(root, "src/a.rs");
         store.refresh(root, 1_048_576).unwrap();
 
         let old = store.search("needle", None, 10).unwrap();

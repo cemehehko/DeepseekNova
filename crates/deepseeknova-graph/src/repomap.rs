@@ -88,7 +88,20 @@ mod tests {
         assert!(map.contains("a.rs:"));
         assert!(map.contains("pub fn high()"));
         assert!(map.find("high").unwrap() < map.find("mid").unwrap());
-        assert!(map.chars().count() <= 40 * 4 + 40);
+
+        // 严格预算不变式（替代魔法 +40）：渲染器按 token 预算累积
+        // （est_tokens = chars/4），输出真实字符上界 = 4*budget + 2*n_symbols。
+        // 每个符号行的固定「│ 」与换行共 3 字符只计 1 token（≈4 字符），加上
+        // chars/4 的整数截断，单符号最多超 2 字符；文件头（path + ⋮）开销
+        // 非正，不增加此界。n_symbols = 输出中「│」前缀数量。
+        let budget = 40usize;
+        let sym = map.matches('│').count();
+        let chars = map.chars().count();
+        assert!(
+            chars <= 4 * budget + 2 * sym,
+            "map chars {chars} exceeds derived bound {} = 4*{budget} + 2*{sym}",
+            4 * budget + 2 * sym
+        );
     }
 
     #[test]
@@ -111,12 +124,14 @@ mod tests {
             .collect();
         let budget = 60usize;
         let map = render_repo_map(&nodes, budget);
-        // 实际输出（含 path 头/│ 前缀/⋮）不得显著超预算：chars <= budget*4 + 小容差
+        // 派生硬上界（同 respects_token_budget 的理由）：4*budget + 2*n_symbols。
+        // 20 个文件各自 path 头开销巨大，只会入选更少符号，界仍成立。
+        let sym = map.matches('│').count();
         let chars = map.chars().count();
         assert!(
-            chars <= budget * 4 + 20,
-            "map chars {chars} exceeds budget {}*4",
-            budget
+            chars <= 4 * budget + 2 * sym,
+            "map chars {chars} exceeds derived bound {} = 4*{budget} + 2*{sym}",
+            4 * budget + 2 * sym
         );
     }
 }

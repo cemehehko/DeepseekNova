@@ -1275,6 +1275,34 @@ mod tests {
     }
 
     #[test]
+    fn cache_builder_prefix_hash_stable_per_map_and_changes_with_map() {
+        // 前缀缓存不变式：同一 map 重复构建 → 相同 hash；不同 map → 不同 hash。
+        // 这是 DeepSeek-V4 prefix cache 语义的守护（hash 漂移 = cache miss）。
+        let map_a = "crates/x/src/a.rs:\n│ pub fn foo()\n⋮";
+        let map_b = "crates/y/src/b.rs:\n│ pub fn bar()\n⋮";
+
+        let mut b1 = CacheAwarePromptBuilder::new(false);
+        let mut b2 = CacheAwarePromptBuilder::new(false);
+        let (_, h1) = b1.build_prefix("SYS", &[], None, Some(map_a));
+        let (_, h2) = b2.build_prefix("SYS", &[], None, Some(map_a));
+        assert_eq!(h1, h2, "同一 map 的 prefix hash 必须稳定");
+
+        let (_, h3) = b1.build_prefix("SYS", &[], None, Some(map_b));
+        assert_ne!(h1, h3, "不同 map 的 prefix hash 必须变化");
+    }
+
+    #[test]
+    fn cache_builder_none_map_still_hashes_stable() {
+        // repo_map 为 None 时 hash 仍确定（不因缺 map 而产生非确定性）。
+        let mut b = CacheAwarePromptBuilder::new(false);
+        let (content, h1) = b.build_prefix("SYS", &[], None, None);
+        let (content2, h2) = b.build_prefix("SYS", &[], None, None);
+        assert_eq!(h1, h2);
+        assert_eq!(content, content2);
+        assert!(!content.contains("Repo Map"));
+    }
+
+    #[test]
     fn prompt_builder_none_map_is_noop() {
         let msgs = PromptBuilder::build(
             "SYS",
