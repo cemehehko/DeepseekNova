@@ -854,7 +854,8 @@ impl CommandHandler for RawCmd {
     async fn run(&self, ctx: &mut CommandCtx<'_>, _args: &str) -> CommandOutcome {
         ctx.app.display_mode = match ctx.app.display_mode {
             crate::app::state::DisplayMode::Normal => crate::app::state::DisplayMode::Lite,
-            crate::app::state::DisplayMode::Lite => crate::app::state::DisplayMode::Raw,
+            crate::app::state::DisplayMode::Lite => crate::app::state::DisplayMode::NoReasoning,
+            crate::app::state::DisplayMode::NoReasoning => crate::app::state::DisplayMode::Raw,
             crate::app::state::DisplayMode::Raw => crate::app::state::DisplayMode::Normal,
         };
         ctx.app.show_notice(ctx.app.tr.t_args(
@@ -1489,6 +1490,8 @@ mod tests {
         let mut app = AppState::default();
         run_cmd("raw", "", &mut app, &caps).await;
         assert_eq!(app.display_mode, DisplayMode::Lite);
+        run_cmd("raw", "", &mut app, &caps).await;
+        assert_eq!(app.display_mode, DisplayMode::NoReasoning);
         run_cmd("raw", "", &mut app, &caps).await;
         assert_eq!(app.display_mode, DisplayMode::Raw);
         run_cmd("raw", "", &mut app, &caps).await;

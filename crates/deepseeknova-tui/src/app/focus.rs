@@ -12,7 +12,7 @@ use crate::i18n::Key;
 use crate::model::conversation::{LineKind, SegId, Segment};
 
 use super::actions::{Action, ActionContext};
-use super::state::{AppState, DisplayMode, KeyAction, RewindState};
+use super::state::{AppState, KeyAction, RewindState};
 
 /// 当前焦点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -516,8 +516,10 @@ impl AppState {
     /// 0 行、展开段按折行估算。由于缺少真实面板宽度与回合间空行，映射为
     /// 尽力而为——短内容精确，长内容可能与真实渲染行号略有偏差。
     fn estimate_segment_rows(&self, seg_id: SegId, seg: &Segment) -> usize {
-        // Lite 模式隐藏推理段。
-        if self.display_mode == DisplayMode::Lite && seg.line_kind() == LineKind::Reasoning {
+        // Lite / NoReasoning 模式隐藏推理段。
+        if crate::app::state::hides_reasoning(self.display_mode)
+            && seg.line_kind() == LineKind::Reasoning
+        {
             return 0;
         }
         // 折叠段显示为单行摘要。

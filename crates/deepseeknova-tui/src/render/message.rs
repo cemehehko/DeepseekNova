@@ -380,8 +380,8 @@ fn build_blocks_with_anchor_lines(
             }
         }
         let kind = seg.line_kind();
-        // Lite 模式隐藏推理。
-        if app.display_mode == DisplayMode::Lite && kind == LineKind::Reasoning {
+        // Lite / NoReasoning 模式隐藏推理。
+        if crate::app::state::hides_reasoning(app.display_mode) && kind == LineKind::Reasoning {
             continue;
         }
         // 三态折叠渲染（grok DisplayMode 对齐）：
@@ -471,7 +471,8 @@ fn build_blocks_with_anchor_lines(
         Some(t) => current_turn_idx == Some(t),
     };
     if show_pending {
-        if !app.conversation.pending_reasoning().is_empty() && app.display_mode != DisplayMode::Lite
+        if !app.conversation.pending_reasoning().is_empty()
+            && !crate::app::state::hides_reasoning(app.display_mode)
         {
             let text = if app.display_mode == DisplayMode::Raw {
                 format!("[reasoning] {}", app.conversation.pending_reasoning())
@@ -1531,6 +1532,26 @@ mod tests {
         let texts: String = blocks.iter().flat_map(block_texts).collect();
         assert!(!texts.contains("think"), "lite 隐藏推理");
         assert!(texts.contains("ans"));
+    }
+
+    #[test]
+    fn no_reasoning_mode_hides_reasoning_but_keeps_normal_layout() {
+        let mut app = AppState::default();
+        app.conversation.begin_turn("q".into());
+        app.apply_run_event(RunEvent::ReasoningDelta {
+            text: "think".into(),
+            signature: None,
+        });
+        app.apply_run_event(RunEvent::TextDelta("ans".into()));
+        app.apply_run_event(RunEvent::Done(done_output("")));
+        app.display_mode = DisplayMode::NoReasoning;
+        let theme = Theme::default();
+        let blocks = build_conversation_blocks(&app, &theme);
+        let texts: String = blocks.iter().flat_map(block_texts).collect();
+        assert!(!texts.contains("think"), "no-reasoning 隐藏推理");
+        assert!(texts.contains("ans"));
+        // 不落入 Raw 前缀模式。
+        assert!(!texts.contains("[agent]"), "no-reasoning 非 raw: {texts}");
     }
 
     #[test]

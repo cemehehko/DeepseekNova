@@ -77,6 +77,8 @@ pub enum Key {
     DisplayModeLite,
     /// 显示模式：raw。
     DisplayModeRaw,
+    /// 显示模式：no-reasoning（仅隐藏推理，其余同 normal）。
+    DisplayModeNoReasoning,
 
     // ── 侧边栏 Tab 标签（app::focus）──────────────────────
     /// 侧边栏 Tab：会话。
@@ -708,6 +710,7 @@ impl Key {
             SidebarWidthNotice => "Sidebar width: {n}",
             DisplayModeNormal => "normal (full)",
             DisplayModeLite => "lite (hide reasoning)",
+            DisplayModeNoReasoning => "no-reasoning (hide reasoning)",
             DisplayModeRaw => "raw (typed prefix)",
 
             // 侧边栏 Tab
@@ -1054,6 +1057,7 @@ impl Key {
             SidebarWidthNotice => "侧边栏宽度: {n}",
             DisplayModeNormal => "normal（全量）",
             DisplayModeLite => "lite（隐藏推理）",
+            DisplayModeNoReasoning => "no-reasoning（隐藏推理）",
             DisplayModeRaw => "raw（带类型前缀）",
 
             // 侧边栏 Tab
@@ -1403,6 +1407,7 @@ impl Key {
             SidebarWidthNotice => "Ширина боковой панели: {n}",
             DisplayModeNormal => "normal (полный)",
             DisplayModeLite => "lite (скрыть рассуждения)",
+            DisplayModeNoReasoning => "no-reasoning (без рассуждений)",
             DisplayModeRaw => "raw (с типизированным префиксом)",
             TabSessions => "Сеансы",
             TabTools => "Инструменты",
@@ -1717,6 +1722,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::SidebarWidthNotice,
     Key::DisplayModeNormal,
     Key::DisplayModeLite,
+    Key::DisplayModeNoReasoning,
     Key::DisplayModeRaw,
     Key::TabSessions,
     Key::TabTools,

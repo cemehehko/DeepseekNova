@@ -74,7 +74,7 @@ impl AttributionBudget {
     /// 尝试消耗一次预算；未超限返回 true（超限后不再消耗）。
     pub fn try_consume(&self) -> bool {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
                 (u < self.max).then_some(u + 1)
             })
             .is_ok()

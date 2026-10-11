@@ -1261,7 +1261,7 @@ DEEPSEEKNOVA_THEME=light  deepseeknova-cli chat --tui   # 印刷星图浅色档�
 | `/scorecard` | 读取 `.deepseeknova/metrics` 最新评分卡，输出六维测光表 |
 | `/skills` | 列出 `.deepseeknova/skills` 与 `.agents/skills` 中的技能 |
 | `/mcp` | 列出已启用 MCP server 并实时探测连接状态（✓ 已连接 / ✗ 未连接） |
-| `/raw` | 切换显示模式 normal / lite / raw（lite 隐藏推理，raw 带类型前缀） |
+| `/raw` | 切换显示模式 normal / lite / no-reasoning / raw（lite 与 no-reasoning 隐藏推理，raw 带类型前缀） |
 | `/fold` | 折叠控制：`/fold all`、`/fold none`、`/fold reset` |
 | `/copy` | 复制当前选中消息 |
 | `/workspace` | 显示当前工作区（路径 + git 分支）、会话数、可用 git worktree 与切换/隔离提示 |

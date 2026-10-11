@@ -16,6 +16,7 @@
 mod audit;
 mod chat;
 mod cli;
+mod cli_i18n;
 mod eval;
 mod init;
 mod mcp_probe;
@@ -97,7 +98,7 @@ mod exit_code {
 }
 
 use async_trait::async_trait;
-use clap::Parser;
+use clap::FromArgMatches;
 use cli::{Cli, Commands};
 use deepseeknova_agent::{CoordinatorRunner, PlanModeRunner};
 use deepseeknova_core::planner::SimplePlanner;
@@ -166,7 +167,17 @@ async fn main() -> Result<(), DeepseeknovaError> {
 /// 各子命令的实际入口。返回进程退出码（`0` = 成功；非零时由 [`main`] 在
 /// `_telemetry_guard` drop 后统一退出，语义见 `exit_code` 模块）。
 async fn run_cli() -> Result<i32, DeepseeknovaError> {
-    let cli = Cli::parse();
+    let cli = {
+        let lang = resolve_cli_help_lang();
+        let mut cmd = cli_i18n::localized_command(lang);
+        let mut matches = match cmd.try_get_matches_from_mut(std::env::args_os()) {
+            Ok(m) => m,
+            Err(err) => {
+                err.exit();
+            }
+        };
+        Cli::from_arg_matches_mut(&mut matches).expect("arg definition mismatch")
+    };
 
     // TUI 全屏模式（alternate screen）下 stdout 被 ratatui 独占，任何
     // tracing 输出都会直接打进画面破坏布局，必须在安装 subscriber 前判定。
@@ -1696,6 +1707,25 @@ fn resolve_ui_lang(config: &deepseeknova_config::Config) -> Option<deepseeknova_
         "ru" | "ru_ru" | "russian" | "русский" => deepseeknova_tui::i18n::Lang::Ru,
         _ => deepseeknova_tui::i18n::Lang::En,
     })
+}
+
+/// 检测 CLI 帮助文本的语言（按优先级：env → config → 默认 En）。
+/// 供 [`cli_i18n`] 确定翻译分派。
+fn resolve_cli_help_lang() -> deepseeknova_tui::i18n::Lang {
+    let env_lang = deepseeknova_tui::i18n::Lang::from_env();
+    if env_lang != deepseeknova_tui::i18n::Lang::En {
+        return env_lang;
+    }
+    // fallback to config
+    match load_config_layers(
+        dirs::home_dir()
+            .map(|home| home.join(".deepseeknova").join("config.toml"))
+            .as_deref(),
+        std::path::Path::new("deepseeknova.toml"),
+    ) {
+        Ok(config) => resolve_ui_lang(&config).unwrap_or(deepseeknova_tui::i18n::Lang::En),
+        Err(_) => deepseeknova_tui::i18n::Lang::En,
+    }
 }
 
 /// 收集工作区文件路径，供 TUI 的 `@` 文件补全注入候选。

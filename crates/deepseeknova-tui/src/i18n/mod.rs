@@ -243,7 +243,7 @@ mod tests {
         // 穷举：每个键的英文值非空；中文/俄文值（显式返回 None 的技术性键
         // 除外）非空。新增词条既要在 en()/zh()/ru() 的 match 补齐（编译器
         // 强制），也要加入 ALL_KEYS 表，否则此测试漏检。
-        assert_eq!(ALL_KEYS.len(), 296, "ALL_KEYS 与枚举变体数一致");
+        assert_eq!(ALL_KEYS.len(), 297, "ALL_KEYS 与枚举变体数一致");
         let tr_en = Tr::new(Lang::En);
         let tr_zh = Tr::new(Lang::Zh);
         let tr_ru = Tr::new(Lang::Ru);

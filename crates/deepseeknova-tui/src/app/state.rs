@@ -29,6 +29,8 @@ pub enum DisplayMode {
     #[default]
     Normal,
     Lite,
+    /// Hide reasoning blocks, otherwise like Normal.
+    NoReasoning,
     Raw,
 }
 
@@ -36,8 +38,15 @@ pub fn display_mode_label(mode: DisplayMode) -> Key {
     match mode {
         DisplayMode::Normal => Key::DisplayModeNormal,
         DisplayMode::Lite => Key::DisplayModeLite,
+        DisplayMode::NoReasoning => Key::DisplayModeNoReasoning,
         DisplayMode::Raw => Key::DisplayModeRaw,
     }
+}
+
+/// 该显示模式下是否隐藏推理块（Lite 与 NoReasoning 都只隐藏推理；
+/// Normal/Raw 展示全部内容）。
+pub fn hides_reasoning(mode: DisplayMode) -> bool {
+    matches!(mode, DisplayMode::Lite | DisplayMode::NoReasoning)
 }
 
 /// 折叠策略（`/fold auto|open|compact` 切换；auto 为智能默认）。

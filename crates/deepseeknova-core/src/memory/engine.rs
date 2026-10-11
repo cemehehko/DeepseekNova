@@ -322,7 +322,7 @@ impl MemoryEngine {
         // 会话硬上限：原子预留槽位，并发下也不会超额（check-then-act 竞态消除）。
         if self
             .session_distills
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 (cur < g.max_per_session).then_some(cur + 1)
             })
             .is_err()
