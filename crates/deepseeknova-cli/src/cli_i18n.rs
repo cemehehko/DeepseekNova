@@ -53,6 +53,9 @@ enum HelpKey {
     ChatModel,
     ChatResume,
     ChatTui,
+    ChatRepl,
+    // ── sessions ───────────────────────────────────
+    SessionsAbout,
     // ── serve ──────────────────────────────────────
     ServeAbout,
     ServeAddr,
@@ -176,8 +179,10 @@ fn en(key: HelpKey) -> &'static str {
         HelpKey::EvalCacheHitRate => "CI threshold: minimum average prefix-cache hit rate (0..1)",
         HelpKey::ChatAbout => "Interactive chat session",
         HelpKey::ChatModel => "Model name",
-        HelpKey::ChatResume => "Resume the most recent saved session's history",
+        HelpKey::ChatResume => "Resume a saved session (no value = most recently modified; or pass a session id)",
         HelpKey::ChatTui => "Launch the full-screen terminal UI instead of the line REPL",
+        HelpKey::ChatRepl => "Force the line REPL even when [ui] mode = \"tui\" (one-off override)",
+        HelpKey::SessionsAbout => "List saved sessions (newest first, by last modification time)",
         HelpKey::ServeAbout => "Start the HTTP/SSE server",
         HelpKey::ServeAddr => "Listen address",
         HelpKey::ServeAcp => "Run as an Agent Client Protocol (ACP) stdio server instead of HTTP",
@@ -279,8 +284,10 @@ fn ru(key: HelpKey) -> &'static str {
         HelpKey::EvalCacheHitRate => "Порог CI: мин. средняя частота попадания в кеш префикса (0..1)",
         HelpKey::ChatAbout => "Интерактивный чат",
         HelpKey::ChatModel => "Имя модели",
-        HelpKey::ChatResume => "Восстановить историю последней сохранённой сессии",
+        HelpKey::ChatResume => "Восстановить сохранённую сессию (без значения — последнюю изменённую; либо передать id)",
         HelpKey::ChatTui => "Запустить полноэкранный TUI вместо REPL",
+        HelpKey::ChatRepl => "Принудительно запустить строковый REPL, даже если [ui] mode = \"tui\" (разовое переопределение)",
+        HelpKey::SessionsAbout => "Список сохранённых сессий (новые сверху, по времени последнего изменения)",
         HelpKey::ServeAbout => "Запустить HTTP/SSE сервер",
         HelpKey::ServeAddr => "Адрес для прослушивания",
         HelpKey::ServeAcp => "Запустить как ACP stdio-сервер вместо HTTP",
@@ -382,8 +389,10 @@ fn zh(key: HelpKey) -> &'static str {
         HelpKey::EvalCacheHitRate => "CI 门槛：前缀缓存命中率平均值下限（0..1）",
         HelpKey::ChatAbout => "交互式聊天会话",
         HelpKey::ChatModel => "模型名称",
-        HelpKey::ChatResume => "恢复最近保存的会话历史",
+        HelpKey::ChatResume => "恢复已保存会话（无值 = 最近修改的；或传入会话 id）",
         HelpKey::ChatTui => "启动全屏终端 UI 替代行式 REPL",
+        HelpKey::ChatRepl => "强制启动行式 REPL，即使 [ui] mode = \"tui\"（一次性覆盖）",
+        HelpKey::SessionsAbout => "列出已保存会话（最新优先，按最后修改时间）",
         HelpKey::ServeAbout => "启动 HTTP/SSE 服务器",
         HelpKey::ServeAddr => "监听地址",
         HelpKey::ServeAcp => "以 ACP stdio 服务器模式运行（替代 HTTP）",
@@ -566,6 +575,11 @@ fn apply_chat(cmd: Command, lang: Lang) -> Command {
         .mut_arg("model", |a| a.help(tr(HelpKey::ChatModel, lang)))
         .mut_arg("resume", |a| a.help(tr(HelpKey::ChatResume, lang)))
         .mut_arg("tui", |a| a.help(tr(HelpKey::ChatTui, lang)))
+        .mut_arg("repl", |a| a.help(tr(HelpKey::ChatRepl, lang)))
+}
+
+fn apply_sessions(cmd: Command, lang: Lang) -> Command {
+    apply_common(cmd, lang).about(tr(HelpKey::SessionsAbout, lang))
 }
 
 fn apply_serve(cmd: Command, lang: Lang) -> Command {
@@ -748,6 +762,7 @@ fn apply_root(cmd: Command, lang: Lang) -> Command {
         .mut_subcommand("scan", |s| apply_scan(s, lang))
         .mut_subcommand("eval", |s| apply_eval(s, lang))
         .mut_subcommand("chat", |s| apply_chat(s, lang))
+        .mut_subcommand("sessions", |s| apply_sessions(s, lang))
         .mut_subcommand("serve", |s| apply_serve(s, lang))
         .mut_subcommand("setup", |s| apply_setup(s, lang))
         .mut_subcommand("config", |s| apply_config(s, lang))
@@ -825,6 +840,8 @@ mod tests {
             HelpKey::ChatModel,
             HelpKey::ChatResume,
             HelpKey::ChatTui,
+            HelpKey::ChatRepl,
+            HelpKey::SessionsAbout,
             HelpKey::ServeAbout,
             HelpKey::ServeAddr,
             HelpKey::ServeAcp,

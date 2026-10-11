@@ -132,13 +132,20 @@ pub enum Commands {
     Chat {
         #[arg(long)]
         model: Option<String>,
-        /// Resume the most recent saved session's history.
-        #[arg(long)]
-        resume: bool,
+        /// Resume a saved session: with no value, the most recently modified
+        /// session (by file mtime); with a `<SESSION_ID>`, that specific one.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
         /// Launch the full-screen terminal UI instead of the line REPL.
-        #[arg(long, conflicts_with = "resume")]
+        /// Overrides `[ui] mode = "repl"`.
+        #[arg(long, conflicts_with = "repl")]
         tui: bool,
+        /// Force the line REPL even when `[ui] mode = "tui"` (one-off override).
+        #[arg(long, conflicts_with = "tui")]
+        repl: bool,
     },
+    /// List saved sessions (newest first, by last modification time).
+    Sessions,
     /// Start the HTTP/SSE server
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -376,12 +383,41 @@ mod tests {
     }
 
     #[test]
-    fn chat_tui_conflicts_with_resume() {
-        let err = Cli::try_parse_from(["deepseeknova", "chat", "--tui", "--resume"]);
-        assert!(
-            err.is_err(),
-            "--tui and --resume must be mutually exclusive"
-        );
+    fn chat_tui_with_resume_parses() {
+        // --tui и --resume больше не конфликтуют: TUI умеет восстановить
+        // последнюю сессию по --resume.
+        let parsed = Cli::try_parse_from(["deepseeknova", "chat", "--tui", "--resume"]);
+        assert!(parsed.is_ok(), "--tui --resume should parse");
+    }
+
+    #[test]
+    fn chat_resume_accepts_optional_session_id() {
+        // Без значения → None (последняя по mtime).
+        let no_id = Cli::try_parse_from(["deepseeknova", "chat", "--resume"]).unwrap();
+        match no_id.command {
+            Some(Commands::Chat { resume, .. }) => assert_eq!(resume, Some(String::new())),
+            _ => panic!("expected chat command"),
+        }
+        // С id → Some(id).
+        let with_id = Cli::try_parse_from([
+            "deepseeknova",
+            "chat",
+            "--resume",
+            "chat-20260101-000000-000-0000",
+        ])
+        .unwrap();
+        match with_id.command {
+            Some(Commands::Chat { resume, .. }) => {
+                assert_eq!(resume.as_deref(), Some("chat-20260101-000000-000-0000"))
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_tui_conflicts_with_repl() {
+        let err = Cli::try_parse_from(["deepseeknova", "chat", "--tui", "--repl"]);
+        assert!(err.is_err(), "--tui and --repl must be mutually exclusive");
     }
 
     #[test]

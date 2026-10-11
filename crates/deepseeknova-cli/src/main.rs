@@ -181,7 +181,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
 
     // TUI 全屏模式（alternate screen）下 stdout 被 ratatui 独占，任何
     // tracing 输出都会直接打进画面破坏布局，必须在安装 subscriber 前判定。
-    let tui_mode = matches!(&cli.command, Some(Commands::Chat { tui: true, .. }));
+    // 该判定依赖已加载的 config（[ui] mode），因此移到下方 load 之后。
 
     // Config is loaded before any subscriber exists, so load-time diagnostics
     // go to stderr directly.
@@ -222,6 +222,15 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 return Ok(exit_code::CONFIG);
             }
         }
+    };
+
+    // TUI 全屏模式判定：CLI 显式 `--tui`/`--repl` 优先于 config `[ui] mode`。
+    // 必须在计算日志等级前完成（TUI 模式下 stdout 被 ratatui 独占）。
+    let tui_mode = match &cli.command {
+        Some(Commands::Chat { tui, .. }) if *tui => true,
+        Some(Commands::Chat { repl, .. }) if *repl => false,
+        Some(Commands::Chat { .. }) => config.ui.is_tui(),
+        _ => false,
     };
 
     // `--secure-defaults` 一键档：权限门控（已默认开启）保持开启 + 沙箱启用
@@ -293,7 +302,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
         // 会直接刷进对话区，降为 WARN 只保留真正需要关注的问题。
         let max_level = if tui_mode {
             LevelFilter::OFF
-        } else if matches!(&cli.command, Some(Commands::Chat { tui: false, .. })) {
+        } else if matches!(&cli.command, Some(Commands::Chat { .. })) {
             LevelFilter::WARN
         } else {
             LevelFilter::INFO
@@ -741,8 +750,11 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
         }
 
         // ── Chat (with /new loop) ────────────────────────────────────────
-        Some(Commands::Chat { model, resume, tui }) => {
-            info!("chat: model={model:?}, resume={resume}, tui={tui}");
+        Some(Commands::Chat { model, resume, .. }) => {
+            info!("chat: model={model:?}, resume={resume:?}, tui={tui_mode}");
+            // 把 --resume 解析成具体会话 id（None=不恢复；最新按 mtime）。
+            let sessions_root = sessions_root(&config);
+            let resume_id = resolve_resume_target(sessions_root.as_deref(), resume);
             // 首启校验：无 provider / API key 缺失时给出 setup 引导并以
             // CONFIG 退出码结束（由 main 在 guard drop 后统一退出），
             // 而不是在 TUI/REPL 启动中途裸错（曾 panic 或闪退）。
@@ -762,7 +774,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
             // Full-screen TUI: build one agent (with a fresh shared history so
             // multi-turn context works) and hand it to the TUI runner.
             // `/model` 热切换通过 agent 工厂重建，`/cost` 走 model router。
-            if *tui {
+            if tui_mode {
                 use deepseeknova_provider::cost::ModelRole;
                 use deepseeknova_provider::factory::ReasoningEffort;
                 // /mcp：列出已启用 server 并做实时连接探测（短超时 spawn 检查存活）。
@@ -786,7 +798,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 });
                 // 会话管理：/new /sessions /resume + 回合落盘（与 REPL 同一持久化）。
                 let session_controller =
-                    build_chat_persistence(sessions_root(&config), history.clone(), false)
+                    build_chat_persistence(sessions_root.clone(), history.clone(), None)
                         .await
                         .map(|p| {
                             Arc::new(TuiSessionController {
@@ -794,6 +806,18 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                             })
                                 as Arc<dyn deepseeknova_tui::SessionController>
                         });
+                // --resume 在 TUI 下同样生效：恢复指定的/最新的会话到对话面板
+                // 与 agent 上下文（ctrl.resume 会切换 session_id 并重填 history，
+                // 后续 record_turn 继续写入该会话，保证上下文连续）。
+                let mut initial_lines: Vec<deepseeknova_tui::ResumedLine> = Vec::new();
+                if let Some(id) = resume_id.as_deref() {
+                    if let Some(ctrl) = &session_controller {
+                        match ctrl.resume(id).await {
+                            Ok(lines) => initial_lines = lines,
+                            Err(e) => tracing::warn!("failed to resume session '{id}': {e}"),
+                        }
+                    }
+                }
                 let factory_router = Arc::clone(&model_router);
                 let cfg = config.clone();
                 // 生效模型名：--model 显式覆盖，否则回落配置 default_model；
@@ -954,13 +978,13 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                     ))
                     .collect();
                 tui = tui.with_at_files(at_candidates);
+                tui = tui.with_initial_history(initial_lines);
                 tui.run().await?;
                 return Ok(0);
             }
 
-            let sessions_root = sessions_root(&config);
             // Resume applies only to the first `/new` cycle.
-            let mut resume_next = *resume;
+            let mut resume_next = resume_id.clone();
 
             // REPL 扩展能力：/undo（checkpoint 快照库）与 /mcp status（实时探测）。
             // 与 TUI 路径同一数据源与控制器实现（tui_undo::TuiUndoController /
@@ -985,10 +1009,9 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 let persist = build_chat_persistence(
                     sessions_root.clone(),
                     Arc::clone(&history),
-                    resume_next,
+                    resume_next.take(),
                 )
                 .await;
-                resume_next = false;
 
                 let history_clone = Arc::clone(&history);
                 let cfg = &config;
@@ -1242,6 +1265,39 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
 
         Some(Commands::Config) => {
             println!("{:#?}", redact_config_for_display(&config));
+        }
+
+        // ── Sessions（列出已保存会话，最新优先，按最后修改时间）──────────
+        Some(Commands::Sessions) => {
+            let root = sessions_root(&config);
+            match root {
+                None => println!("session persistence is disabled"),
+                Some(dir) => match deepseeknova_store::SessionStore::new(dir) {
+                    Ok(store) => match store.list_summaries() {
+                        Ok(summaries) if summaries.is_empty() => {
+                            println!("(no saved sessions yet)");
+                        }
+                        Ok(summaries) => {
+                            println!("Saved sessions (newest first, by last activity):");
+                            for s in &summaries {
+                                let title = s
+                                    .title
+                                    .as_deref()
+                                    .map(|t| format!(" — {t}"))
+                                    .unwrap_or_default();
+                                let ws = s
+                                    .workspace
+                                    .as_deref()
+                                    .map(|w| format!("  [{w}]"))
+                                    .unwrap_or_default();
+                                println!("  {}  ({} turns){title}{ws}", s.id, s.turns);
+                            }
+                        }
+                        Err(e) => eprintln!("failed to list sessions: {e}"),
+                    },
+                    Err(e) => eprintln!("failed to open session store: {e}"),
+                },
+            }
         }
 
         // ── Memory (审查/检索/编辑/删除/回放/统计) ───────────────────────
@@ -1631,8 +1687,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                     Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
                 let persist =
-                    build_chat_persistence(sessions_root.clone(), Arc::clone(&history), false)
-                        .await;
+                    build_chat_persistence(sessions_root.clone(), Arc::clone(&history), None).await;
 
                 let history_clone = Arc::clone(&history);
                 let cfg = &config;
@@ -2136,12 +2191,12 @@ fn mcp_server_infos(config: &deepseeknova_config::Config) -> Vec<deepseeknova_tu
 ///
 /// Returns `None` (persistence disabled) when no root is available or the
 /// store can't be opened — chat still works, it just isn't recorded. When
-/// `resume` is set, the newest saved session is loaded into `history` and
-/// becomes the active session; any failure falls back to a fresh session.
+/// `resume_id` is `Some`, that session is loaded into `history` and becomes
+/// the active session; any failure falls back to a fresh session.
 async fn build_chat_persistence(
     root: Option<std::path::PathBuf>,
     history: Arc<tokio::sync::Mutex<Vec<deepseeknova_core::Message>>>,
-    resume: bool,
+    resume_id: Option<String>,
 ) -> Option<chat::ChatPersistence> {
     // 工作区根路径：会话聚合/按项目查看用（记录到每回合的 workspace 字段）。
     let workspace = std::env::current_dir()
@@ -2162,33 +2217,25 @@ async fn build_chat_persistence(
     let mut session_id = deepseeknova_store::new_session_id();
     let mut turn = 0u64;
 
-    if resume {
-        // Session ids sort lexicographically by time, so max() is the newest.
-        let latest = store
-            .list_sessions()
-            .ok()
-            .and_then(|ids| ids.into_iter().max());
-        match latest {
-            Some(id) => match store.load(&id) {
-                Ok(turns) if !turns.is_empty() => {
-                    let mut hist = history.lock().await;
-                    for t in &turns {
-                        for m in &t.messages {
-                            hist.push(m.into());
-                        }
+    if let Some(id) = resume_id.as_deref() {
+        match store.load(id) {
+            Ok(turns) if !turns.is_empty() => {
+                let mut hist = history.lock().await;
+                for t in &turns {
+                    for m in &t.messages {
+                        hist.push(m.into());
                     }
-                    let restored = hist.len();
-                    drop(hist);
-                    session_id = id.clone();
-                    turn = turns.len() as u64;
-                    println!("resumed session '{id}' — {restored} messages restored");
                 }
-                Ok(_) => tracing::warn!("latest session '{id}' is empty; starting fresh"),
-                Err(e) => {
-                    tracing::warn!("failed to load session '{id}' for resume: {e}; starting fresh")
-                }
-            },
-            None => tracing::warn!("no saved session to resume; starting fresh"),
+                let restored = hist.len();
+                drop(hist);
+                session_id = id.to_string();
+                turn = turns.len() as u64;
+                println!("resumed session '{id}' — {restored} messages restored");
+            }
+            Ok(_) => tracing::warn!("session '{id}' is empty; starting fresh"),
+            Err(e) => {
+                tracing::warn!("failed to load session '{id}' for resume: {e}; starting fresh")
+            }
         }
     }
 
@@ -2200,6 +2247,32 @@ async fn build_chat_persistence(
         titles: titles?,
         workspace,
     })
+}
+
+/// 把 `--resume`（`None`=不恢复 / `Some("")`=最新 / `Some(id)`=指定）解析成
+/// 具体会话 id。最新选择按文件 mtime（`list_summaries` 最新优先），而非会话
+/// 创建时间（旧实现用 id 字典序 max，会把「继续过很多次的旧会话」排到后面）。
+fn resolve_resume_target(
+    root: Option<&std::path::Path>,
+    resume: &Option<String>,
+) -> Option<String> {
+    let resume = resume.as_deref()?;
+    if resume.is_empty() {
+        // 最新（按 mtime）。
+        let store = deepseeknova_store::SessionStore::new(root?.to_path_buf()).ok()?;
+        return store
+            .list_summaries()
+            .ok()
+            .and_then(|s| s.into_iter().next())
+            .map(|s| s.id);
+    }
+    // 显式 id：白名单校验，防路径越界。
+    if deepseeknova_store::is_valid_session_id(resume) {
+        Some(resume.to_string())
+    } else {
+        tracing::warn!("invalid session id '{resume}'; starting fresh");
+        None
+    }
 }
 
 /// TUI 会话控制器：把 REPL 的 ChatPersistence 适配到 TUI 的 `/new` `/sessions`

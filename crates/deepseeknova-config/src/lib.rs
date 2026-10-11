@@ -1493,14 +1493,28 @@ pub struct UiConfig {
     /// `None` 时回退 `DEEPSEEKNOVA_LANG` 环境变量（缺省英文）。
     #[serde(default)]
     pub lang: Option<String>,
+    /// 界面模式：`"repl"`（默认，行式 REPL）| `"tui"`（全屏终端界面）。
+    /// `None`/未知值回退 `repl`。CLI `--tui`/`--repl` 可一次性覆盖。
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 impl UiConfig {
-    /// 非默认值覆盖（Option 级）：仅 `other.lang` 非 None 时覆盖。
+    /// 非默认值覆盖（Option 级）：仅 `other.lang` / `other.mode` 非 None 时覆盖。
     fn merge(&mut self, other: UiConfig) {
         if other.lang.is_some() {
             self.lang = other.lang;
         }
+        if other.mode.is_some() {
+            self.mode = other.mode;
+        }
+    }
+
+    /// 是否启用全屏 TUI 模式（`"tui"` 不区分大小写；其余回退 `repl`）。
+    pub fn is_tui(&self) -> bool {
+        self.mode
+            .as_ref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("tui"))
     }
 }
 
@@ -2756,6 +2770,7 @@ mod tests {
         let mut base = Config {
             ui: UiConfig {
                 lang: Some("zh".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2767,11 +2782,56 @@ mod tests {
         let project_with = Config {
             ui: UiConfig {
                 lang: Some("en".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
         base.merge(project_with);
         assert_eq!(base.ui.lang.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn ui_mode_merge_and_is_tui() {
+        // 默认：未设定 → REPL（is_tui = false）。
+        let def = UiConfig::default();
+        assert!(!def.is_tui());
+
+        // 显式 tui（大小写/空白归一）→ is_tui = true。
+        for raw in ["tui", "TUI", " Tui "] {
+            let cfg = UiConfig {
+                mode: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.is_tui(), "{raw:?} should be tui");
+        }
+
+        // 未知值 → 回退 repl。
+        let unknown = UiConfig {
+            mode: Some("fullscreen".into()),
+            ..Default::default()
+        };
+        assert!(!unknown.is_tui());
+
+        // merge：用户层设 mode，项目层缺省 → 保留用户层。
+        let mut base = Config {
+            ui: UiConfig {
+                mode: Some("tui".into()),
+                lang: None,
+            },
+            ..Default::default()
+        };
+        base.merge(Config::default());
+        assert!(base.ui.is_tui());
+
+        // 项目层显式设 mode → 覆盖用户层。
+        base.merge(Config {
+            ui: UiConfig {
+                mode: Some("repl".into()),
+                lang: None,
+            },
+            ..Default::default()
+        });
+        assert!(!base.ui.is_tui());
     }
 
     #[test]

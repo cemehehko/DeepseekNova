@@ -143,6 +143,8 @@ pub struct TuiRunner {
     lang: Lang,
     /// TUI 交互 trace 日志目录（`Some` = 开启 `[trace]`，CLI 注入；None = 关闭）。
     trace_dir: Option<PathBuf>,
+    /// 启动时预填充对话面板的行（CLI `--resume` 恢复最新会话时注入）。
+    initial_lines: Vec<crate::app::state::ResumedLine>,
 }
 
 impl TuiRunner {
@@ -180,6 +182,7 @@ impl TuiRunner {
             git_branch: None,
             lang: Lang::from_env(),
             trace_dir: None,
+            initial_lines: Vec::new(),
         }
     }
 
@@ -346,6 +349,13 @@ impl TuiRunner {
         self
     }
 
+    /// 启动时把恢复的会话行预填充到对话面板（CLI `chat --tui --resume` 注入）。
+    /// 空列表等效未设置；非空时 `run_inner` 会调用 `restore_conversation`。
+    pub fn with_initial_history(mut self, lines: Vec<crate::app::state::ResumedLine>) -> Self {
+        self.initial_lines = lines;
+        self
+    }
+
     /// 注入主模型上下文窗口上限（tokens），CLI 从 config 模型定义读取；
     /// 缺省/None 时状态行与 `/cost` 不显示占用率百分比。
     pub fn with_context_window(mut self, window: Option<u32>) -> Self {
@@ -471,6 +481,10 @@ impl TuiRunner {
         app.mouse_capture = true;
         // 全屏欢迎屏：启动时激活（首次提交后清除，见 dispatch ChatSubmit）。
         app.welcome = true;
+        // 启动即恢复会话（`chat --tui --resume`）：预填对话面板并清 welcome。
+        if !self.initial_lines.is_empty() {
+            app.restore_conversation(std::mem::take(&mut self.initial_lines));
+        }
         // 侧边栏 MCP 面板数据源：从 caps 复制已启用 server 清单。
         app.mcp_servers = caps.mcp_servers.clone();
         // 用户键位定制（keybindings.json）：启动时加载，事件循环轮询热重载。

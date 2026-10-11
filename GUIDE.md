@@ -582,16 +582,27 @@ stage / recency，权重 `rank_lifecycle_weight`，=0 时与纯 bm25 等价）�
 (1-w)*余弦` 融合，默认 w=0.5）；缺 key/网络错 fail-open 回落纯 FTS。旧索引
 无需重建（SCHEMA 增量加向量表，打开即迁移）。
 
-### 界面语言（`[ui]`）
+### 界面（`[ui]`）
 
 ```toml
 [ui]
 lang = "en"   # en（默认）| zh（接受 zh-cn/cn/chinese/中文 别名）
+mode = "repl" # repl（默认，行式 REPL）| tui（全屏终端界面）
 ```
 
 `lang` 缺省回退 `DEEPSEEKNOVA_LANG` 环境变量（`zh`/`zh-cn`/`cn`/`chinese`/`中文` →
 中文，其余/缺省 → 英文），两者皆缺省为英文。词表结构见
 `crates/deepseeknova-tui/src/i18n/`。
+
+`mode` 决定 `deepseeknova-cli chat` 默认启动的界面：`repl`（缺省）为行式 REPL，
+`tui` 为全屏终端界面（非 `tui` 且非空的值回退 `repl`）。CLI 旗标优先于配置，
+用于一次性覆盖：
+
+```text
+chat           → 按 [ui] mode（缺省 repl）
+chat --tui     → 强制 TUI（覆盖 [ui] mode = "repl"）
+chat --repl    → 强制 REPL（覆盖 [ui] mode = "tui"）
+```
 
 ### TUI 交互 trace 日志（`[trace]`）
 
@@ -1116,6 +1127,34 @@ Launch the interactive terminal UI:
 ```bash
 deepseeknova-cli chat --tui
 ```
+
+返回上次保存的会话（自动恢复**最近修改**会话的上下文与对话面板）：
+
+```bash
+deepseeknova-cli chat --tui --resume
+```
+
+`--resume` 也接受会话 id 来恢复指定会话（不只 последнюю）：
+
+```bash
+deepseeknova-cli chat --tui --resume chat-20261011-125956-613-0000
+```
+
+列出全部会话（新→旧，按最后修改时间）——可从控制台直接调用：
+
+```bash
+deepseeknova-cli sessions
+```
+
+同一个 `--resume [id]` 语法在行式 REPL 下同样生效：
+
+```bash
+deepseeknova-cli chat --resume
+deepseeknova-cli chat --resume chat-20261011-125956-613-0000
+```
+
+若 `[ui] mode = "tui"`，直接 `deepseeknova-cli chat` 即进入 TUI；需要一次性
+回到行式 REPL 时用 `chat --repl`。
 
 ### Layout
 
