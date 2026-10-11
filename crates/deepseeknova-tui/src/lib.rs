@@ -57,8 +57,10 @@ pub mod input;
 mod model;
 mod render;
 mod theme;
+mod trace;
 
 pub use i18n::{Key, Lang, Tr};
+pub use trace::{TraceEvent, TraceStore};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -139,6 +141,8 @@ pub struct TuiRunner {
     git_branch: Option<String>,
     /// 界面语言（`DEEPSEEKNOVA_LANG` 解析：`en`/`zh`/`ru`，缺省英文；`with_lang` 可覆盖）。
     lang: Lang,
+    /// TUI 交互 trace 日志目录（`Some` = 开启 `[trace]`，CLI 注入；None = 关闭）。
+    trace_dir: Option<PathBuf>,
 }
 
 impl TuiRunner {
@@ -175,6 +179,7 @@ impl TuiRunner {
             workspace_cwd: String::new(),
             git_branch: None,
             lang: Lang::from_env(),
+            trace_dir: None,
         }
     }
 
@@ -182,6 +187,13 @@ impl TuiRunner {
     /// 缺省为英文；`Lang::Zh` / `Lang::Ru` 分别切换到中文/俄文。
     pub fn with_lang(mut self, lang: Lang) -> Self {
         self.lang = lang;
+        self
+    }
+
+    /// 开启/关闭 TUI 交互 trace 日志目录（`[trace] enabled` 由 CLI 传入）。
+    /// `Some(dir)` 时在 `dir/trace/<ts>.jsonl` 记录完整交互流；`None` 关闭。
+    pub fn with_trace(mut self, dir: Option<PathBuf>) -> Self {
+        self.trace_dir = dir;
         self
     }
 
@@ -441,6 +453,19 @@ impl TuiRunner {
                 workspace_root: self.workspace_root.clone().unwrap_or_default(),
                 rule_count: self.project_rule_count,
             });
+        }
+        // TUI 交互 trace 日志：CLI 注入的目录非 None 时打开 store 并写入
+        // SessionStart 首行。打开失败静默降级（trace 不阻塞 TUI 启动）。
+        if let Some(dir) = &self.trace_dir {
+            if let Ok(mut store) = TraceStore::open(dir) {
+                let _ = store.write(&TraceEvent::SessionStart {
+                    ts: trace::unix_millis(),
+                    dir: dir.display().to_string(),
+                    model: self.model_label.clone(),
+                    lang: format!("{:?}", lang),
+                });
+                app.trace = Some(store);
+            }
         }
         // 与上方 EnableMouseCapture 保持一致：鼠标捕获默认开启。
         app.mouse_capture = true;

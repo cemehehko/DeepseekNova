@@ -1007,6 +1007,7 @@ dependencies = [
  "deepseeknova-skills",
  "dirs",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

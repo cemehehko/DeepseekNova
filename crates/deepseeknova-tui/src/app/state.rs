@@ -480,6 +480,50 @@ pub struct AppState {
     /// 对话区当前屏幕范围（draw 时写入；事件循环左键点击据此判断是否
     /// 落在对话区内——审查#5：此前无条件转发，点输入框/状态栏也会折叠）。
     pub conv_area: Option<ratatui::layout::Rect>,
+    /// TUI 交互 trace 日志（None = 未开启 `[trace] enabled`）。开启时事件
+    /// 循环把用户/agent/工具/审批流写入 JSONL 文件供离线复盘。
+    pub trace: Option<crate::trace::TraceStore>,
+    /// 本轮运行 token/工具/错误累加器（提交时重置，Done/Cancel 时快照
+    /// 为 `TraceEvent::TurnSummary`）。开启 trace 后才需要，故字段始终
+    /// 存在但仅在 trace 开启时有实际写入。
+    pub turn_accum: TurnAccum,
+}
+
+/// 单个回合（一次 `run_stream`）的局部分组统计累加器：在 `apply_run_event`
+/// 中顺带累加 token/工具体量/错误，回合结束时由事件循环快照为
+/// [`crate::trace::TurnSummary`]。与 `session_cache_hit`/`session_cache_miss`
+/// 的“会话级累计”互补，这里是“逐回合”口径。
+#[derive(Debug, Default)]
+pub struct TurnAccum {
+    /// prompt token 累计。
+    pub prompt_tokens: u64,
+    /// completion token 累计。
+    pub completion_tokens: u64,
+    /// reasoning token 累计。
+    pub reasoning_tokens: u64,
+    /// total token 累计。
+    pub total_tokens: u64,
+    /// cache hit token 累计。
+    pub cache_hit_tokens: u64,
+    /// cache miss token 累计。
+    pub cache_miss_tokens: u64,
+    /// metered LLM 调用次数（每次 `RunEvent::Usage` +1）。
+    pub llm_calls: u64,
+    /// call_id → 工具名（`ToolCallStart`/`End` 写入，`ToolResult` 反查）。
+    pub call_name: HashMap<String, String>,
+    /// 按工具名分组的调用体量（calls/args_bytes/result_bytes/errors）。
+    pub tools: HashMap<String, crate::trace::ToolStat>,
+    /// 本轮错误次数（`AppEvent::Error` 计）。
+    pub errors: u64,
+    /// 暂停原因（`RunEvent::Paused` 写入；回合结束据此判定 outcome=Paused）。
+    pub pause_reason: Option<String>,
+}
+
+impl TurnAccum {
+    /// 清空所有计数器，回到未开始状态。
+    pub fn reset(&mut self) {
+        *self = TurnAccum::default();
+    }
 }
 
 /// Ctrl+P 命令面板状态：模态浮层，模糊搜索 + 最近使用排序
@@ -624,6 +668,64 @@ pub enum ActiveModal {
 }
 
 impl AppState {
+    /// Записать событие в trace-лог (no-op при выключенном `[trace]`).
+    /// Ошибки записи молча игнорируются — trace не должен ломать TUI.
+    pub fn trace(&mut self, event: crate::trace::TraceEvent) {
+        if let Some(store) = &mut self.trace {
+            let _ = store.write(&event);
+        }
+    }
+
+    /// Собрать [`crate::trace::TurnSummary`] из `turn_accum` и передать
+    /// 结束态. `outcome`/`elapsed` вычисляет调用方 (事件循环), `cost` 从
+    /// router ledger 会话累计值填充, `errors` 累加器已在 `apply_run_event`
+    /// 与 `AppEvent::Error` 中维护. 调用后调用方须 `turn_accum.reset()`.
+    pub fn snapshot_turn_summary(
+        &self,
+        turn: usize,
+        outcome: crate::trace::TurnOutcome,
+        elapsed_secs: f32,
+        cost: crate::trace::TurnCost,
+    ) -> crate::trace::TurnSummary {
+        let a = &self.turn_accum;
+        let hit_plus_miss = a.cache_hit_tokens + a.cache_miss_tokens;
+        let cache_hit_rate =
+            (hit_plus_miss > 0).then(|| a.cache_hit_tokens as f64 / hit_plus_miss as f64);
+        let avg_step_secs = (a.llm_calls > 0).then(|| f64::from(elapsed_secs) / a.llm_calls as f64);
+        let mut tools = a.tools.clone();
+        // Детерминированный порядок в JSON (по имени).
+        let mut by_name: Vec<(String, crate::trace::ToolStat)> = tools.drain().collect();
+        by_name.sort_by(|(an, _), (bn, _)| an.cmp(bn));
+        let total_calls: u64 = by_name.iter().map(|(_, s)| s.calls).sum();
+        let args_bytes: u64 = by_name.iter().map(|(_, s)| s.args_bytes).sum();
+        let result_bytes: u64 = by_name.iter().map(|(_, s)| s.result_bytes).sum();
+        crate::trace::TurnSummary {
+            turn,
+            outcome,
+            pause_reason: a.pause_reason.clone(),
+            elapsed_secs,
+            avg_step_secs,
+            errors: a.errors,
+            tokens: crate::trace::TurnTokenStats {
+                prompt_tokens: a.prompt_tokens,
+                completion_tokens: a.completion_tokens,
+                reasoning_tokens: a.reasoning_tokens,
+                total_tokens: a.total_tokens,
+                cache_hit_tokens: a.cache_hit_tokens,
+                cache_miss_tokens: a.cache_miss_tokens,
+                cache_hit_rate,
+                llm_calls: a.llm_calls,
+            },
+            tools: crate::trace::TurnToolStats {
+                total_calls,
+                args_bytes,
+                result_bytes,
+                by_name: by_name.into_iter().collect(),
+            },
+            cost,
+        }
+    }
+
     /// 回显一行（命令反馈）。
     pub fn echo_line(&mut self, kind: crate::model::conversation::LineKind, text: &str) {
         self.echo.push(UiLine {
@@ -733,6 +835,39 @@ impl AppState {
                 .session_cache_miss
                 .saturating_add(u64::from(usage.cache_miss_tokens));
             self.usage = Some(usage.clone());
+            // 逐回合累加（trace 快照用）。
+            self.turn_accum.prompt_tokens += u64::from(usage.prompt_tokens);
+            self.turn_accum.completion_tokens += u64::from(usage.completion_tokens);
+            self.turn_accum.reasoning_tokens += u64::from(usage.reasoning_tokens);
+            self.turn_accum.total_tokens += u64::from(usage.total_tokens);
+            self.turn_accum.cache_hit_tokens += u64::from(usage.cache_hit_tokens);
+            self.turn_accum.cache_miss_tokens += u64::from(usage.cache_miss_tokens);
+            self.turn_accum.llm_calls += 1;
+        }
+        match &ev {
+            RunEvent::ToolCallStart { id, name } => {
+                self.turn_accum.call_name.insert(id.clone(), name.clone());
+            }
+            RunEvent::ToolCallEnd {
+                id,
+                name,
+                arguments,
+            } => {
+                self.turn_accum.call_name.insert(id.clone(), name.clone());
+                let stat = self.turn_accum.tools.entry(name.clone()).or_default();
+                stat.args_bytes += arguments.len() as u64;
+            }
+            RunEvent::ToolResult { call_id, result } => {
+                if let Some(name) = self.turn_accum.call_name.get(call_id).cloned() {
+                    let stat = self.turn_accum.tools.entry(name).or_default();
+                    stat.calls += 1;
+                    stat.result_bytes += result.len() as u64;
+                }
+            }
+            RunEvent::Paused { reason, .. } => {
+                self.turn_accum.pause_reason = Some(reason.clone());
+            }
+            _ => {}
         }
         self.conversation.apply(ev, self.tr);
     }
@@ -1478,6 +1613,68 @@ mod tests {
         // /resume 走 restore_conversation：会话切换，统计清零。
         app.restore_conversation(vec![]);
         assert_eq!((app.session_cache_hit, app.session_cache_miss), (0, 0));
+    }
+
+    #[test]
+    fn turn_accum_snapshots_tokens_tools_and_pause_outcome() {
+        let mut app = AppState::default();
+        app.apply_run_event(RunEvent::Usage(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            reasoning_tokens: 12,
+            cache_hit_tokens: 80,
+            cache_miss_tokens: 20,
+        }));
+        app.apply_run_event(RunEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "shell".into(),
+        });
+        app.apply_run_event(RunEvent::ToolCallEnd {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        });
+        app.apply_run_event(RunEvent::ToolResult {
+            call_id: "c1".into(),
+            result: "README.md".into(),
+        });
+        app.apply_run_event(RunEvent::Paused {
+            reason: "reached max steps".into(),
+            session_id: None,
+        });
+
+        let summary = app.snapshot_turn_summary(
+            1,
+            crate::trace::TurnOutcome::Paused,
+            3.0,
+            crate::trace::TurnCost::default(),
+        );
+
+        assert_eq!(summary.turn, 1);
+        assert_eq!(summary.outcome, crate::trace::TurnOutcome::Paused);
+        assert_eq!(summary.pause_reason.as_deref(), Some("reached max steps"));
+        assert_eq!(summary.tokens.prompt_tokens, 100);
+        assert_eq!(summary.tokens.completion_tokens, 20);
+        assert_eq!(summary.tokens.reasoning_tokens, 12);
+        assert_eq!(summary.tokens.llm_calls, 1);
+        assert_eq!(summary.tokens.cache_hit_tokens, 80);
+        assert_eq!(summary.tokens.cache_miss_tokens, 20);
+        // hit / (hit+miss) = 80 / 100 = 0.8
+        assert!((summary.tokens.cache_hit_rate.unwrap() - 0.8).abs() < 1e-9);
+        assert_eq!(summary.tools.total_calls, 1);
+        assert_eq!(summary.tools.result_bytes, 9); // "README.md"
+        let shell = summary.tools.by_name.get("shell").unwrap();
+        assert_eq!(shell.calls, 1);
+        assert_eq!(shell.args_bytes, "{\"cmd\":\"ls\"}".len() as u64);
+        assert!((summary.avg_step_secs.unwrap() - 3.0).abs() < 1e-9);
+
+        // reset 后累加器归零。
+        app.turn_accum.reset();
+        assert_eq!(app.turn_accum.llm_calls, 0);
+        assert_eq!(app.turn_accum.cache_hit_tokens, 0);
+        assert!(app.turn_accum.tools.is_empty());
+        assert!(app.turn_accum.pause_reason.is_none());
     }
 
     #[test]

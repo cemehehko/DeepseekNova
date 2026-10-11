@@ -176,7 +176,7 @@ pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'sta
     if let Some(branch) = &app.git_branch {
         left.push((
             PRIO_WORKSPACE,
-            Line::from(vec![Span::styled(format!(" ⎇ {branch}"), dim)]),
+            Line::from(vec![Span::styled(format!(" ⎇ {branch} "), dim)]),
         ));
     } else if !app.workspace_cwd.is_empty() {
         let normalized = app.workspace_cwd.replace('\\', "/");
@@ -186,16 +186,16 @@ pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'sta
             .unwrap_or(&normalized);
         left.push((
             PRIO_WORKSPACE,
-            Line::from(vec![Span::styled(format!(" {name}"), dim)]),
+            Line::from(vec![Span::styled(format!(" {name} "), dim)]),
         ));
     }
     let state = if app.running {
         Span::styled(
-            "●",
+            "● ",
             Style::default().fg(theme.semantic(SemanticTone::Success)),
         )
     } else {
-        Span::styled("○", dim)
+        Span::styled("○ ", dim)
     };
     let model_text = if app.effort_label.is_empty() {
         app.model_label.clone()
@@ -502,9 +502,9 @@ fn grok_ctx_segment(app: &AppState, theme: &Theme) -> Option<(u8, Line<'static>)
         // hover：进度条（10 格）+ 5 字符百分比（grok context_bar hover 观感）。
         let filled = (pct.min(100) * 10).div_ceil(100) as usize;
         let bar = "█".repeat(filled) + &"░".repeat(10 - filled);
-        format!("{bar} {}", fmt_pct5(pct))
+        format!(" {bar} {}", fmt_pct5(pct))
     } else {
-        format!("{} / {}", fmt_tokens(used), fmt_tokens(window))
+        format!(" {} / {}", fmt_tokens(used), fmt_tokens(window))
     };
     Some((
         PRIO_CTX,
@@ -987,6 +987,10 @@ mod tests {
         assert!(
             wide_text.contains("4.0K / 128K"),
             "宽行含 grok ctx: {wide_text}"
+        );
+        assert!(
+            wide_text.contains("deepseek-v4-flash-0731 4.0K / 128K"),
+            "ctx 段紧邻模型名且以空格分隔: {wide_text}"
         );
         assert!(
             !wide_text.contains("lines 30"),

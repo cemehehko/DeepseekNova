@@ -21,6 +21,7 @@ use crate::commands::TuiCaps;
 use crate::commands::{CommandCtx, CommandOutcome, CommandRegistry};
 use crate::i18n::Key;
 use crate::model::conversation::LineKind;
+use crate::trace::TraceEvent;
 use state::{AppState, KeyAction, PasteChip, PasteChipKind};
 
 /// ctx 计量的有效窗口：`min(context_window, budget_window)`——预算才是真实
@@ -428,6 +429,10 @@ pub async fn run_loop(
                                     app.turn += 1;
                                     app.last_prompt = Some(prompt.clone());
                                     app.conversation.begin_turn(prompt.clone());
+                                    app.trace(TraceEvent::UserSubmit {
+                                        ts: crate::trace::unix_millis(),
+                                        prompt: prompt.clone(),
+                                    });
                                     // grok 对齐：首次提交生成会话标题
                                     //（首条 user 消息首行，截 60 字符）。
                                     if app.session_title.is_none() {
@@ -505,6 +510,26 @@ pub async fn run_loop(
                                 }
                                 KeyAction::Cancel => {
                                     if let Some(handle) = current_run.take() {
+                                        app.trace(TraceEvent::Cancel {
+                                            ts: crate::trace::unix_millis(),
+                                        });
+                                        // 取消是回合结局之一：在 abort 前快照统计，
+                                        // 让 trace 保留取消前的 token/тул 用量。
+                                        let elapsed = app
+                                            .run_started_at
+                                            .map(|t| t.elapsed().as_secs_f32())
+                                            .unwrap_or(0.0);
+                                        let summary = app.snapshot_turn_summary(
+                                            app.turn,
+                                            crate::trace::TurnOutcome::Cancelled,
+                                            elapsed,
+                                            build_turn_cost(caps),
+                                        );
+                                        app.trace(TraceEvent::TurnSummary {
+                                            ts: crate::trace::unix_millis(),
+                                            summary,
+                                        });
+                                        app.turn_accum.reset();
                                         handle.abort();
                                         session.cancel();
                                         app.conversation.mark_current_cancelled();
@@ -635,10 +660,19 @@ pub async fn run_loop(
                                     }
                                 }
                             }
+                            app.trace(TraceEvent::Run {
+                                ts: crate::trace::unix_millis(),
+                                event: ev.clone().into(),
+                            });
                             app.apply_run_event(ev);
                         }
                         AppEvent::Error { gen, text } => {
+                            app.trace(TraceEvent::Error {
+                                ts: crate::trace::unix_millis(),
+                                text: text.clone(),
+                            });
                             if session.accepts(gen) {
+                                app.turn_accum.errors += 1;
                                 app.conversation
                                     .push_system(crate::model::conversation::SystemKind::Error, text);
                             } else {
@@ -659,6 +693,24 @@ pub async fn run_loop(
                                 .map(|t| t.elapsed().as_secs_f32())
                                 .unwrap_or(0.0);
                             let round = app.turn;
+                            app.trace(TraceEvent::TurnComplete {
+                                ts: crate::trace::unix_millis(),
+                                turn: round,
+                                elapsed_secs: elapsed,
+                            });
+                            // 回合结束统计：token/кэш/тулы/тайминги/стоимость.
+                            let outcome = if app.turn_accum.pause_reason.is_some() {
+                                crate::trace::TurnOutcome::Paused
+                            } else {
+                                crate::trace::TurnOutcome::Done
+                            };
+                            let cost = build_turn_cost(caps);
+                            let summary = app.snapshot_turn_summary(round, outcome, elapsed, cost);
+                            app.trace(TraceEvent::TurnSummary {
+                                ts: crate::trace::unix_millis(),
+                                summary,
+                            });
+                            app.turn_accum.reset();
                             app.running = false;
                             app.run_started_at = None;
                             current_run = None;
@@ -682,9 +734,37 @@ pub async fn run_loop(
     }
 }
 
+/// Построить session-накопительную стоимость для сводки回合 из router ledger.
+/// Возвращает `TurnCost::default()` (total_usd None, пустые rows) при
+/// отсутствии router.
+fn build_turn_cost(caps: &TuiCaps) -> crate::trace::TurnCost {
+    let Some(router) = caps.runtime.lock().ok().and_then(|rt| rt.router.clone()) else {
+        return crate::trace::TurnCost::default();
+    };
+    let report = router.ledger().report(&router.price_table());
+    crate::trace::TurnCost {
+        total_usd: report.total_usd,
+        rows: report
+            .rows
+            .into_iter()
+            .map(|r| crate::trace::TurnCostRow {
+                model: r.model,
+                role: r.role.label().to_string(),
+                cost_usd: r.cost_usd,
+            })
+            .collect(),
+        unmetered_calls: report.unmetered_calls,
+    }
+}
+
 /// 处理 `/` 命令。返回 `true` 表示退出。
 async fn handle_command(app: &mut AppState, caps: &TuiCaps, cmd: &str) -> bool {
     let (name, args) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+    app.trace(TraceEvent::Command {
+        ts: crate::trace::unix_millis(),
+        name: name.to_string(),
+        args: args.to_string(),
+    });
     match CommandRegistry::find(name) {
         Some(command) => {
             let mut ctx = CommandCtx { app, caps };

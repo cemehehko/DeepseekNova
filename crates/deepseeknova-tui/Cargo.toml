@@ -21,6 +21,7 @@ deepseeknova-provider = { workspace = true }
 deepseeknova-skills = { workspace = true }
 deepseeknova-checkpoint = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }

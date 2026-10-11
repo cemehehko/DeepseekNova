@@ -593,6 +593,19 @@ lang = "en"   # en（默认）| zh（接受 zh-cn/cn/chinese/中文 别名）
 中文，其余/缺省 → 英文），两者皆缺省为英文。词表结构见
 `crates/deepseeknova-tui/src/i18n/`。
 
+### TUI 交互 trace 日志（`[trace]`）
+
+```toml
+[trace]
+enabled = true   # 默认 false
+```
+
+开启后 TUI 把完整交互流（用户 prompt → agent 推理/正文 → 工具调用与结果 →
+验证 → 审批决策 → token 用量 → 回合完成）以结构化 JSONL 逐行写入
+`./.deepseeknova/trace/<timestamp>.jsonl`，供离线复盘 agent 行为是否正确。
+每行带 `kind` 判别标签与 `ts`（unix 毫秒）。内容**不截断** — reasoning、正文、
+工具参数与结果全部原样落盘，因此文件可能含敏感数据，妥善保管。
+
 **记忆用户面（CLI）**：除 agent 的 `remember`/`recall`/`forget` 工具外，可用
 `deepseeknova-cli memory` 直接浏览与管理记忆库：
 

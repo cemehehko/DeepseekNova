@@ -905,6 +905,13 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 }
                 tui = tui.with_context_window(context_window);
                 tui = tui.with_budget_window(budget_window);
+                // TUI 交互 trace 日志：`[trace] enabled` 时把完整交互流写入
+                // `./.deepseeknova/trace/<ts>.jsonl` 供离线复盘 agent 行为。
+                let trace_dir = config
+                    .trace
+                    .enabled
+                    .then(|| workspace_root.join(".deepseeknova"));
+                tui = tui.with_trace(trace_dir);
                 // 权限模式切换（Ctrl+P / /mode）与工作区信任确认：gate 与 agent
                 // 持有同一实例（运行时已接 mode/trusted 初始状态）；TrustController
                 // 委托 config TrustStore（`~/.deepseeknova/trusted.toml`）。

@@ -95,6 +95,12 @@ pub struct Config {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
 
+    /// TUI interaction trace logging (agent/model/user/tool decisions).
+    /// Disabled by default; when enabled, the TUI writes a JSONL trace to
+    /// `./.deepseeknova/trace/`.
+    #[serde(default)]
+    pub trace: TraceConfig,
+
     /// 会话效能度量（SessionMetrics）落盘开关（默认 true）。
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -1426,6 +1432,24 @@ pub struct TelemetryConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Trace（TUI 交互 trace 日志）
+// ---------------------------------------------------------------------------
+
+/// TUI interaction trace logging configuration.
+///
+/// Disabled by default. When enabled, the TUI writes a structured JSONL trace
+/// of the full interaction (user prompt → agent reasoning/text → tool calls &
+/// results → verification → approval decisions → usage) to
+/// `./.deepseeknova/trace/<timestamp>.jsonl`, for offline review of whether the
+/// agent behaved correctly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TraceConfig {
+    /// Whether TUI interaction trace logging is enabled (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Metrics（会话效能度量）
 // ---------------------------------------------------------------------------
 
@@ -1962,6 +1986,7 @@ impl Config {
         self.sandbox.merge(other.sandbox);
         self.security.merge(other.security);
         self.telemetry.merge(other.telemetry);
+        self.trace.merge(other.trace);
         self.model_pointers.merge(other.model_pointers);
         self.memory.merge(other.memory);
         self.delegate.merge(other.delegate);
@@ -2469,6 +2494,17 @@ impl TelemetryConfig {
         self.enabled = other.enabled;
         if other.otlp_endpoint.is_some() {
             self.otlp_endpoint = other.otlp_endpoint;
+        }
+    }
+}
+
+impl TraceConfig {
+    /// 深度合并 `[trace]`：仅当 `other.enabled` 非默认值时覆盖，避免项目层
+    /// 的缺省值清掉用户层显式开启（与 MetricsConfig 同款非默认值覆盖模式）。
+    fn merge(&mut self, other: TraceConfig) {
+        let d = TraceConfig::default();
+        if other.enabled != d.enabled {
+            self.enabled = other.enabled;
         }
     }
 }

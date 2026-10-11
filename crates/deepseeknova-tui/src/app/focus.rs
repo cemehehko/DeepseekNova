@@ -130,12 +130,24 @@ impl AppState {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     if let Some(req) = self.pending_approval.take() {
                         let _ = req.reply.send(true);
+                        self.trace(crate::trace::TraceEvent::ApprovalDecision {
+                            ts: crate::trace::unix_millis(),
+                            id: req.id,
+                            title: req.title,
+                            allowed: true,
+                        });
                     }
                     KeyAction::None
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     if let Some(req) = self.pending_approval.take() {
                         let _ = req.reply.send(false);
+                        self.trace(crate::trace::TraceEvent::ApprovalDecision {
+                            ts: crate::trace::unix_millis(),
+                            id: req.id,
+                            title: req.title,
+                            allowed: false,
+                        });
                     }
                     KeyAction::None
                 }

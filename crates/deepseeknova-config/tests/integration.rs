@@ -340,6 +340,38 @@ fn telemetry_merge_overrides_endpoint() {
     );
 }
 
+#[test]
+fn trace_disabled_by_default() {
+    let cfg = Config::default();
+    assert!(!cfg.trace.enabled);
+}
+
+#[test]
+fn trace_toml_parse() {
+    let toml = r#"
+[trace]
+enabled = true
+"#;
+    let cfg: Config = toml::from_str(toml).unwrap();
+    assert!(cfg.trace.enabled);
+}
+
+#[test]
+fn trace_merge_overrides_enabled() {
+    let mut base = Config::default();
+    base.trace.enabled = true;
+
+    // Overlay with enabled=true: preserved true.
+    let mut overlay = Config::default();
+    overlay.trace.enabled = true;
+    base.merge(overlay);
+    assert!(base.trace.enabled, "项目层 true 不覆盖用户层 true");
+
+    // Overlay without `[trace]` (default false): user layer true preserved.
+    base.merge(Config::default());
+    assert!(base.trace.enabled, "项目层缺省 false 不得清掉用户层开启");
+}
+
 // ---------------------------------------------------------------------------
 // Model pointers & pricing (multi-model orchestration)
 // ---------------------------------------------------------------------------
