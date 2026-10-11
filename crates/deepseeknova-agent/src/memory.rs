@@ -239,6 +239,24 @@ impl Memory {
             }
         }
 
+        // 钉住对话锚点：从 system 之后到第一个「真用户轮次」为止的全部消息
+        // （含可能位于其前的 <recalled-memory> 召回注入）一并保护，绝不驱逐。
+        // 首个真用户消息 = 首个 role==User 且非 <recalled-memory> 合成注入，
+        // 即用户开口的第一条意图 —— 对应 `pinned` 的 "first user turn" 契约。
+        let mut saved_anchor: Vec<Message> = Vec::new();
+        while let Some(front) = self.messages.front() {
+            let is_genuine_user =
+                front.role == Role::User && !front.content.starts_with("<recalled-memory>");
+            if let Some(msg) = self.messages.pop_front() {
+                saved_anchor.push(msg);
+            } else {
+                break; // 防御性：理论上不可达
+            }
+            if is_genuine_user {
+                break;
+            }
+        }
+
         let mut dropped_ids = Vec::new();
 
         while let Some(front) = self.messages.front() {
@@ -297,7 +315,12 @@ impl Memory {
             self.shrunk_messages.remove(&id);
         }
 
-        // 把暂存的 System 消息放回队列最前，保持 prefix cache 稳定性。
+        // 先放回对话锚点（召回注入 + 首个用户轮次），再放回 System 消息；
+        // push_front 后插入者在最前，故 System 最后插即位于队列最前，
+        // 锚点紧随其后，保持 原顺序：System → anchor → …。
+        for am in saved_anchor.into_iter().rev() {
+            self.messages.push_front(am);
+        }
         for sm in saved_system.into_iter().rev() {
             self.messages.push_front(sm);
         }
@@ -433,6 +456,8 @@ mod tests {
     /// System 消息（system prompt + repo map）经 add_message 进入 messages 队列
     /// （agent 主路径 [mod.rs] 的真实路径），slide_window 绝不能弹掉它，
     /// 否则破坏 DeepSeek-V4 prefix cache 并丢失身份/规则。
+    /// 同时首个「真用户轮次」是对话锚点，也须保留（对应 `pinned` 的
+    /// "first user turn" 契约）。
     #[test]
     fn slide_window_preserves_system_message_in_queue() {
         let mut m = Memory::new();
@@ -450,12 +475,46 @@ mod tests {
         // System 消息必须保留在队列最前
         assert_eq!(all[0].role, Role::System);
         assert_eq!(all[0].content, "system prompt + repo map");
-        // 第一个 Turn Chunk（User+Assistant+Tool）应被滑出，turn2 应保留
+        // 对话锚点（首个用户轮次）保留；其后的首个 turn chunk
+        // （resp1 + tool1）被滑出，turn2 保留。
         let contents: Vec<_> = all.iter().map(|x| x.content.as_str()).collect();
-        assert!(!contents.contains(&"turn1"));
+        assert!(contents.contains(&"turn1"));
         assert!(!contents.contains(&"resp1"));
         assert!(!contents.contains(&"tool1"));
         assert!(contents.contains(&"turn2"));
         assert!(contents.contains(&"resp2"));
+    }
+
+    /// 对话锚点保护须覆盖其前的合成召回注入：<recalled-memory> 之后的
+    /// 首个真用户消息不可丢失，且被驱逐的 turn chunk 不留下孤儿 tool result。
+    #[test]
+    fn slide_window_preserves_anchor_after_recalled_memory() {
+        let mut m = Memory::new();
+        m.add_message(msg(Role::System, "system"));
+        // 模拟 recall 注入位于首个用户消息之前（新会话 volatile 前缀区）。
+        m.add_message(msg(Role::User, "<recalled-memory>blob</recalled-memory>"));
+        m.add_message(msg(Role::User, "first real ask"));
+        m.add_message(msg_with_calls("resp1", &["tc1"]));
+        m.add_message(msg_tool_result("tc1", "tool1"));
+        m.add_message(msg(Role::User, "second ask"));
+        m.add_message(msg(Role::Assistant, "resp2"));
+
+        m.slide_window();
+
+        let all = m.get_all();
+        let contents: Vec<_> = all.iter().map(|x| x.content.as_str()).collect();
+        // 召回注入 + 首个用户消息均保留（锚点整体钉住）。
+        assert!(contents.contains(&"<recalled-memory>blob</recalled-memory>"));
+        assert!(contents.contains(&"first real ask"));
+        // 首个 turn chunk（resp1 + tool1）被滑出，second ask 保留。
+        assert!(!contents.contains(&"resp1"));
+        assert!(!contents.contains(&"tool1"));
+        assert!(contents.contains(&"second ask"));
+        assert!(contents.contains(&"resp2"));
+        // 无孤儿 tool result：残留消息里不存在已丢失 tool_call 的结果。
+        assert!(
+            deepseeknova_context::history::validate_replay_invariant(&all).is_ok(),
+            "slide after anchor pin must not orphan a tool result"
+        );
     }
 }
