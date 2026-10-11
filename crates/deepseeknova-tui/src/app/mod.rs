@@ -202,6 +202,15 @@ pub async fn run_loop(
             .effort_str()
             .unwrap_or_default()
             .to_string();
+        // 当前模型标签：每帧从 runtime 刷新（/model switch 热切换后立即反映）。
+        // 修复：此前 app.model_label 仅启动时赋值，/model switch 更新 runtime.model_label
+        // 但未回写 app，导致状态行继续显示启动时模型（如 deepseek-v4-flash）。
+        app.model_label = caps
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .model_label
+            .clone();
         terminal.draw(|f| app.draw(f))?;
 
         // 消费 `/` 面板待执行命令（真实 caps）。
