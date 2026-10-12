@@ -821,12 +821,15 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                 }
                 let factory_router = Arc::clone(&model_router);
                 let cfg = config.clone();
-                // 生效模型名：--model 显式覆盖，否则回落配置 default_model；
-                // 仍为空时取 provider 自带 model（曾只回落到这里导致界面标签
-                // 显示无意义的 "default"）。
+                // 生效模型名必须与 router 的实际解析一致：--model 显式覆盖，
+                // 否则取 model_pointers.main（router 主角色指针），仍为空时回落
+                // 首个 provider 自带的 model。曾回落到 config.default_model，但
+                // router 并不消费该字段——导致状态行显示 default_model（如
+                // deepseek-v4-flash），而实际请求走 provider.model（如
+                // deepseek-v4-pro-0813）。
                 let effective_model = model
                     .clone()
-                    .or_else(|| cfg.default_model.clone())
+                    .or_else(|| model_router.pointer(ModelRole::Main))
                     .or_else(|| cfg.providers.first().and_then(|p| p.model.clone()));
                 let context_window = resolve_provider_cfg(&cfg, effective_model.as_deref())
                     .map(|p| p.context_window)
