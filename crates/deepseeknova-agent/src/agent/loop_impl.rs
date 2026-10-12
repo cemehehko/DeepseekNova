@@ -363,6 +363,24 @@ pub(crate) async fn run_agent_loop(
 
         info!("agent step {}/{}", step + 1, max_steps);
 
+        // ── loop_guard 反应器：把告警 hint 反注入回模型 prompt ──
+        // LoopWarning 此前仅作为可观测事件流（TUI/CLI/serve 消费），模型本身
+        // 看不到，导致连续只读重读到 max steps 也无反馈。此处把最近的 hint
+        // 以 User 消息注入 memory，让下一步 provider 直接看到「你已 N 步无进展，
+        // 请转向 write/edit 或收尾」。（Ф4 loop_guard 反应器）
+        if let Some(hint) = loop_guard.take_hint_for_injection() {
+            memory.write().await.add_message(Message {
+                role: Role::User,
+                content: format!("[loop_guard] {hint}"),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                reasoning_signature: None,
+                usage: None,
+            });
+        }
+
         // A1 热路径：每步取一次会话历史快照，步内 budget 判定 / 压缩判定 /
         // 机械续步分类 / provider 请求复用同一快照，消除步内 5-10 次全量
         // 克隆。压缩等**修改会话**的路径在修改后重新快照（provider 必须

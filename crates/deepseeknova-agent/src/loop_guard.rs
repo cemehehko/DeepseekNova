@@ -143,6 +143,10 @@ pub struct LoopGuard {
     steps_without_progress: u64,
     /// 停滞告警是否已发出（单个停滞段只发一次，避免刷屏）。
     stagnant_warned: bool,
+    /// 最近一次告警的 hint 文本（供 run-loop 反注入回模型 prompt）。
+    last_hint: Option<String>,
+    /// `last_hint` 是否已被 run-loop 取走并注入（防重复注入同一 hint）。
+    hint_delivered: bool,
     /// 解析后的进展工具集合（含内置默认 + 显式配置）。
     progress_tools: HashMap<String, ()>,
 }
@@ -163,6 +167,8 @@ impl LoopGuard {
             current_tool: None,
             steps_without_progress: 0,
             stagnant_warned: false,
+            last_hint: None,
+            hint_delivered: false,
             progress_tools,
         }
     }
@@ -247,7 +253,23 @@ impl LoopGuard {
             }
         }
 
+        // 记录告警供 run-loop 反注入：新 hint 置未交付。
+        if let Some(w) = &warning {
+            self.last_hint = Some(w.hint.clone());
+            self.hint_delivered = false;
+        }
+
         warning
+    }
+
+    /// 取走待注入的告警 hint（若尚未被 run-loop 交付过）。取走后置已交付，
+    /// 同一 hint 不会重复注入（进展重置后再触发新告警才会产生新 hint）。
+    pub fn take_hint_for_injection(&mut self) -> Option<String> {
+        if self.hint_delivered {
+            return None;
+        }
+        self.hint_delivered = true;
+        self.last_hint.clone()
     }
 
     /// 当前连续重复次数（供诊断/测试）。
@@ -411,5 +433,25 @@ mod tests {
         let again = guard.observe(&settings, "read_file", r#"{"path":"d"}"#);
         assert!(again.is_none());
         assert!(warned);
+    }
+
+    #[test]
+    fn take_hint_delivers_once_then_resets_on_new_warning() {
+        let settings = LoopGuardSettings::default(); // max_repeat_same_call = 3
+        let mut guard = LoopGuard::new(&settings);
+        let args = r#"{"path":"src/main.rs"}"#;
+        guard.observe(&settings, "read_file", args);
+        guard.observe(&settings, "read_file", args);
+        let w = guard.observe(&settings, "read_file", args).unwrap();
+        assert!(w.hint.contains("重复"));
+
+        // hint доступен для инъекции ровно один раз.
+        let first = guard.take_hint_for_injection();
+        assert!(first.is_some(), "первый вызов должен вернуть hint");
+        let second = guard.take_hint_for_injection();
+        assert!(
+            second.is_none(),
+            "повторный вызов не должен дублировать hint"
+        );
     }
 }
