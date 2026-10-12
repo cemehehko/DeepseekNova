@@ -1435,6 +1435,69 @@ impl Store {
         Ok(out)
     }
 
+    /// Explore-кандидаты: по непокрытым (без `node_tags`) путям, равномерно
+    /// **по crate/домену** (не по узлу — иначе крупные crate вытеснят малые),
+    /// возвращает до `budget` узлов. Семплинг: для каждого непокрытого crate
+    /// берём до `per_crate` самых высокоранговых (PageRank `score`) не-файловых
+    /// узлов. Используется для blind-gap: подмешивать в `search_code` то, что
+    /// лексика гарантированно не достаёт.
+    pub fn search_explore(&self, per_crate: usize, budget: usize) -> Result<Vec<Node>, GraphError> {
+        let paths = self.uncovered_paths()?;
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // crate-сегмент: "crates/<name>/..." → name; иначе первый сегмент пути.
+        fn crate_of(p: &str) -> &str {
+            let mut segs = p.split('/');
+            let first = segs.next().unwrap_or("");
+            let second = segs.next().unwrap_or("");
+            if first == "crates" && !second.is_empty() {
+                second
+            } else if !first.is_empty() {
+                first
+            } else {
+                ""
+            }
+        }
+        // uncovered путей → множество, быстрый фильтр.
+        let uncovered: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+        // все не-файловые узлы, сгруппированные по crate.
+        let all = self.all_nodes()?;
+        let mut by_crate: HashMap<String, Vec<Node>> = HashMap::new();
+        for n in all {
+            if n.kind == NodeKind::File {
+                continue;
+            }
+            if !uncovered.contains(n.path.as_str()) {
+                continue;
+            }
+            by_crate
+                .entry(crate_of(&n.path).to_string())
+                .or_default()
+                .push(n);
+        }
+        // детерминированный порядок crate-ов → равномерная доля бюджета по домену.
+        let mut crates: Vec<String> = by_crate.keys().cloned().collect();
+        crates.sort();
+        let mut out: Vec<Node> = Vec::new();
+        for c in crates {
+            let mut nodes = by_crate.remove(&c).unwrap_or_default();
+            // PageRank score убывает → топ по значимости внутри crate.
+            nodes.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            nodes.truncate(per_crate);
+            out.extend(nodes);
+            if out.len() >= budget {
+                break;
+            }
+        }
+        out.truncate(budget);
+        Ok(out)
+    }
+
     /// 全部边。
     pub fn all_edges(&self) -> Result<Vec<EdgeRec>, GraphError> {
         let mut stmt = self.conn.prepare("SELECT src, dst, kind FROM edges")?;
@@ -3040,6 +3103,40 @@ require github.com/single/dep v1.0.0\n";
         assert!(
             store.uncovered_paths().unwrap().is_empty(),
             "全部节点标记后应无未覆盖路径"
+        );
+    }
+
+    #[test]
+    fn search_explore_samples_evenly_across_crates() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "crates/a/src/lib.rs",
+            "pub fn a1() {}\npub fn a2() {}\n",
+        );
+        write(root, "crates/b/src/lib.rs", "pub fn b1() {}\n");
+        let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
+        store.refresh(root, 1_048_576).unwrap();
+
+        // per_crate=1, budget=10 → 每个 crate 最多 1 节点；a и b оба представлены.
+        let got = store.search_explore(1, 10).unwrap();
+        let crate_a = got.iter().any(|n| n.path.starts_with("crates/a/"));
+        let crate_b = got.iter().any(|n| n.path.starts_with("crates/b/"));
+        assert!(crate_a, "должны попасть узлы из crate a: {got:?}");
+        assert!(crate_b, "должны попасть узлы из crate b: {got:?}");
+        assert_eq!(
+            got.len(),
+            2,
+            "per_crate=1 → по одному узлу из каждого crate"
+        );
+
+        // per_crate=3 → crate a отдаст 2 узла (всего 2 функции), b — 1.
+        let got3 = store.search_explore(3, 10).unwrap();
+        assert_eq!(
+            got3.len(),
+            3,
+            "все непокрытые символы должны быть семплированы"
         );
     }
 }

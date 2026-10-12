@@ -214,6 +214,12 @@ impl GraphIndex {
         self.store.file_node(path)
     }
 
+    /// 按符号名查找全部候选节点（可能多个重名定义），供 `tag_code` 等按名
+    /// 解析实体 id 用。
+    pub fn find_by_name(&self, name: &str) -> Result<Vec<Node>, GraphError> {
+        self.store.find_by_name(name)
+    }
+
     /// 全库外部依赖事实（path=清单文件路径, dep_name）。
     pub fn external_deps(&self) -> Result<Vec<(String, String)>, GraphError> {
         self.store.external_deps()
@@ -241,6 +247,14 @@ impl GraphIndex {
     /// 「理解过」的代码交给大模型评估，避免对已覆盖域重复花费。
     pub fn uncovered_paths(&self) -> Result<Vec<String>, GraphError> {
         self.store.uncovered_paths()
+    }
+
+    /// Explore-кандидаты для blind-gap：по непокрытым путям, равномерно **по
+    /// crate** (не по узлу), до `budget` узлов, внутри crate — топ по PageRank
+    /// (`per_crate` на crate). Подмешиваются в `search_code` вместе с BM25 top-K,
+    /// чтобы лексика не была единственным источником кандидатов.
+    pub fn search_explore(&self, per_crate: usize, budget: usize) -> Result<Vec<Node>, GraphError> {
+        self.store.search_explore(per_crate, budget)
     }
 
     /// 测试专用：手写预计算嵌入（生产不再写入，见 `Store::seed_embedding`）。

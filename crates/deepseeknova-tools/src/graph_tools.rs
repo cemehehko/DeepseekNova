@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use deepseeknova_core::{DeepseeknovaError, Tool, ToolContext, ToolSchema};
-use deepseeknova_graph::{Direction, EdgeKind, GraphError, NodeKind};
+use deepseeknova_graph::{Direction, EdgeKind, GraphError, Node, NodeKind};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,29 +108,35 @@ impl Tool for SearchCodeTool {
         };
 
         let kind = parsed.kind.as_deref().and_then(NodeKind::parse);
+        // Rerank-контур (Ф3): отдаём модели широкий кандидатный сет (top-50) +
+        // explore-семпл, ранжирование отдаётся самой модели (не вызываем LLM
+        // отдельно — дешевле и без отдельного ключа). Чистый BM25: `search`,
+        // без `search_best`/embedding (embedding из hot-path убран).
         let limit = parsed.limit.unwrap_or(10).min(50);
         let query = parsed.query.clone();
-        // `search_best`：装配了嵌入后端（`[memory] embedder = "remote"`）时走
-        // hybrid（语义+词法融合），否则逐字节委托 `search`（零行为变化）。
-        // 整个 lock+检索 经 spawn_blocking 移出 tokio worker——hybrid 路径的
-        // 查询嵌入是 HTTP（最长 30s），不能占用 worker 线程（与 remember/recall
-        // 工具同款模式）。
-        let nodes = match tokio::task::spawn_blocking(move || {
-            let idx = lock_index(&handle)?;
-            Ok::<_, DeepseeknovaError>(idx.search_best(&query, kind, limit))
+        let idx_clone = handle.clone();
+        // 整个 lock+检索 经 spawn_blocking 移出 tokio worker（与 remember/recall 同款）。
+        let fetched = tokio::task::spawn_blocking(move || {
+            let idx = lock_index(&idx_clone)?;
+            let hits: Vec<Node> = idx.search(&query, kind, limit)?;
+            // Explore: непокрытые crate-ы (blind-gap) — всегда подмешиваем семпл,
+            // чтобы лексика не была единственным источником кандидатов. Обходимся
+            // без отдельного флага: семпл дешёв (LIMIT внутри SQL, top по PageRank).
+            let explore = idx.search_explore(2, 12)?;
+            Ok::<_, DeepseeknovaError>((hits, explore))
         })
-        .await
-        {
-            Ok(Ok(Ok(n))) => n,
-            Ok(Ok(Err(e))) => return Ok(graph_error_message("searching code", &e)),
-            Ok(Err(e)) => return Ok(format!("graph index unavailable: {e}")),
+        .await;
+
+        let (nodes, explore) = match fetched {
+            Ok(Ok((hits, explore))) => (hits, explore),
+            Ok(Err(e)) => return Ok(format!("code graph search error: {e}")),
             Err(e) => return Ok(format!("graph search task failed: {e}")),
         };
 
-        if nodes.is_empty() {
+        if nodes.is_empty() && explore.is_empty() {
             return Ok(format!("no matches for '{}'", parsed.query));
         }
-        let lines: Vec<String> = nodes
+        let mut lines: Vec<String> = nodes
             .iter()
             .enumerate()
             .map(|(i, node)| {
@@ -146,6 +152,29 @@ impl Tool for SearchCodeTool {
                 )
             })
             .collect();
+
+        // explore-кандидаты маркируются отдельной группой, чтобы модель
+        // понимала: это низкоранговый/непокрытый семпл, а не топ BM25.
+        if !explore.is_empty() {
+            let mut dedup: std::collections::HashSet<&str> =
+                nodes.iter().map(|n| n.path.as_str()).collect();
+            let mut shown = 0usize;
+            for node in &explore {
+                if dedup.insert(node.path.as_str()) {
+                    shown += 1;
+                    lines.push(format!(
+                        "e{}. {} {} — {}:{}-{} · {}  [explore]",
+                        shown,
+                        node.kind.as_str(),
+                        node.name,
+                        node.path,
+                        node.start_line,
+                        node.end_line,
+                        node.signature
+                    ));
+                }
+            }
+        }
         Ok(lines.join("\n"))
     }
 }
@@ -952,6 +981,81 @@ impl Tool for DepsCodeTool {
     }
 }
 
+/// Дистилляция retrieval-метки (Ф4): модель сама помечает узел смысловыми
+/// тегами после того, как подтвердила его релевантность. Метка попадает в
+/// `node_tags` + `tag_fts`, т.е. в следующий раз лексика (BM25) по этим термам
+/// уже найдёт узел без повторного explore/rerank. Писатель меток = сама модель.
+pub struct TagCodeTool;
+
+#[derive(Deserialize)]
+struct TagCodeArgs {
+    entity: String,
+    tags: String,
+}
+
+#[async_trait]
+impl Tool for TagCodeTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "tag_code".to_string(),
+            description: "Distills semantic tags onto a code entity you confirmed relevant. Tags are space-separated keywords (e.g. \"trace span metric\"). Persisted to the code graph so subsequent search_code finds it lexically. Use after you verified the entity solves the query.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Symbol name (as returned by search_code)."
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Space-separated semantic keywords describing what this entity does."
+                    }
+                },
+                "required": ["entity", "tags"]
+            }),
+        }
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        args: &str,
+    ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+        deepseeknova_security::context::enforce_capability(
+            ctx,
+            &self.schema().name,
+            deepseeknova_security::capability::Capability::FileWrite,
+        )?;
+        let parsed: TagCodeArgs = serde_json::from_str(args)?;
+        let handle = match graph_handle(ctx) {
+            Some(h) => h,
+            None => return Ok(NO_INDEX_MSG.to_string()),
+        };
+        let idx = lock_index(&handle)?;
+        // entity → node id через find_by_name (первый кандидат).
+        let id = match idx.find_by_name(&parsed.entity) {
+            Ok(nodes) if !nodes.is_empty() => nodes[0].id.clone(),
+            _ => {
+                return Ok(format!(
+                    "entity '{}' not found; tag nothing (use search_code first).",
+                    parsed.entity
+                ))
+            }
+        };
+        match idx.tag_node(&id, &parsed.tags, "distill") {
+            Ok(()) => Ok(format!(
+                "tagged '{}' with '{}' (persisted to code graph).",
+                parsed.entity, parsed.tags
+            )),
+            Err(e) => Ok(format!("failed to tag: {e}")),
+        }
+    }
+}
+
 /// graph.enabled 时由 runtime 注册的三个高级图查询工具。
 /// 注册点选在 runtime（白名单内），不动 all_builtin 列表及其 schema 预算测试。
 pub fn graph_query_tools() -> Vec<Arc<dyn Tool>> {
@@ -960,6 +1064,7 @@ pub fn graph_query_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ImpactCodeTool),
         Arc::new(ExploreCodeTool),
         Arc::new(DepsCodeTool),
+        Arc::new(TagCodeTool),
     ]
 }
 
@@ -1297,5 +1402,57 @@ mod tests {
         let out = DepsCodeTool.execute(&ctx, r#"{}"#).await.unwrap();
         assert!(out.contains("github.com/foo/bar: 1 files"), "{out}");
         assert!(out.contains("go.mod"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn tag_code_distills_then_recallable_lexically() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Функция с именем/doc, не пересекающимися с тегами — лексика по тегам её
+        // изначально не находит (классический blind-gap).
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "/// internal helper\npub fn probe_hook() {}\n",
+        )
+        .unwrap();
+        let ctx = ctx_with_index(root);
+
+        // До дистилляции probe_hook попадает ТОЛЬКО как explore-кандидат (blind-gap),
+        // а не как BM25-хит. Проверяем: нет строки "1. function probe_hook" (BM25 top).
+        let before = SearchCodeTool
+            .execute(&ctx, r#"{"query":"tracing instrumentation"}"#)
+            .await
+            .unwrap();
+        let before_bm25 = before
+            .lines()
+            .any(|l| l.contains("probe_hook") && !l.contains("[explore]"));
+        assert!(
+            !before_bm25,
+            "до дистилляции лексика не должна ранжировать probe_hook как BM25-хит: {before}"
+        );
+
+        // Модель подтвердила узел → дистиллирует метку.
+        let tagged = TagCodeTool
+            .execute(
+                &ctx,
+                r#"{"entity":"probe_hook","tags":"tracing instrumentation"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(tagged.contains("tagged"), "{tagged}");
+
+        // Теперь лексика находит узел как BM25-хит (без [explore]-метки).
+        let after = SearchCodeTool
+            .execute(&ctx, r#"{"query":"tracing instrumentation"}"#)
+            .await
+            .unwrap();
+        let after_bm25 = after
+            .lines()
+            .any(|l| l.contains("probe_hook") && !l.contains("[explore]"));
+        assert!(
+            after_bm25,
+            "дистилляция должна поднять узел в BM25-хиты по тегам: {after}"
+        );
     }
 }
