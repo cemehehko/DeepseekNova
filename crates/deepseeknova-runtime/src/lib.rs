@@ -333,16 +333,10 @@ pub fn build_agent_with_role_providers(
     // stalls build_agent's return or the tokio worker pool. A refresh failure
     // only warns — the agent still runs, graph tools just degrade gracefully.
     if config.graph.enabled {
-        // P2-2 语义检索接线：复用记忆侧 embedder（`[memory] embedder = "remote"`）。
-        // 缺 key/网络错 fail-open 回落纯 FTS（try_memory_embedder 返回 None 时
-        // open_with_embedder 等价 open）。
-        let embedder = deepseeknova_provider::embeddings::try_memory_embedder(&config.memory);
-        match deepseeknova_graph::GraphIndex::open_with_embedder(
-            &workspace_root,
-            config.graph.max_file_size,
-            embedder,
-            "graph-embed",
-        ) {
+        // 代码图检索：BM25 + 结构图（无 embedding）。语义召回改由检索成功后的
+        // 蒸馏标签（`GraphIndex::tag_node` → `tag_fts`）承载，不预计算向量。
+        // `open` 纯词法，零额外依赖。
+        match deepseeknova_graph::GraphIndex::open(&workspace_root, config.graph.max_file_size) {
             Ok(index) => {
                 let handle: deepseeknova_tools::GraphHandle =
                     Arc::new(std::sync::Mutex::new(index));

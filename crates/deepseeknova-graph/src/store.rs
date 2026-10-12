@@ -175,6 +175,16 @@ CREATE TABLE IF NOT EXISTS node_embeddings(
   embedding BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_node_embeddings_model ON node_embeddings(model);
+CREATE TABLE IF NOT EXISTS node_tags(
+  id TEXT PRIMARY KEY,
+  tags TEXT NOT NULL,
+  source TEXT,
+  updated INTEGER
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS tag_fts USING fts5(
+  id UNINDEXED, tags, tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS tag_fts_cjk USING fts5(
+  id UNINDEXED, tags, tokenize='trigram');
 ";
 
 /// 当前 schema 版本：v2 引入 raw_calls/raw_imports 事实表与全局边重建；
@@ -438,9 +448,9 @@ impl Store {
                 doc: String::new(),
                 score: 0.0,
             };
-            insert_node(&tx, &file_node, self.embedder.as_deref(), &self.embed_model)?;
+            insert_node(&tx, &file_node)?;
             for def in &parsed.nodes {
-                insert_node(&tx, def, self.embedder.as_deref(), &self.embed_model)?;
+                insert_node(&tx, def)?;
                 tx.execute(
                     "INSERT INTO edges(src, dst, kind) VALUES(?1, ?2, ?3)",
                     (&file_node.id, &def.id, EdgeKind::Contains.as_str()),
@@ -986,6 +996,47 @@ impl Store {
                 raw.push(row?);
             }
         }
+
+        // ── 蒸馏标签补召回 ──
+        // 大模型按检索成功写在 node_tags 的短标签，也经 tag_fts 参与词法命中：
+        // 标签命中但 name/signature/doc 不含查询词的节点（典型 blind-gap）也能进栈。
+        // 分数复用同一 BM25 语义（负分），与主 FTS 归一化合并同批处理。
+        let tag_table = if cjk_mode { "tag_fts_cjk" } else { "tag_fts" };
+        {
+            let tag_sql = format!(
+                "SELECT n.id, n.kind, n.name, n.path, n.start_line, n.end_line, n.signature, n.doc, n.score, bm25({tag_table}) AS fts_bm25 FROM {tag_table} t JOIN nodes n ON n.id = t.id WHERE {tag_table} MATCH ?1 ORDER BY bm25({tag_table}) LIMIT 200"
+            );
+            let mut stmt = self.conn.prepare(&tag_sql)?;
+            let rows = stmt.query_map((&match_expr,), |row| {
+                let node = node_from_row(row)?;
+                let s: f64 = row.get("fts_bm25")?;
+                Ok((node, s))
+            })?;
+            let mut tag_raw: Vec<(Node, f64)> = Vec::new();
+            for row in rows {
+                tag_raw.push(row?);
+            }
+            // 合并去重：同 id 保留更相关（更小负分）的一条。
+            let mut seen: HashMap<String, usize> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, (n, _))| (n.id.clone(), i))
+                .collect();
+            for (n, s) in tag_raw {
+                match seen.get(&n.id) {
+                    Some(&idx) => {
+                        if s < raw[idx].1 {
+                            raw[idx] = (n, s);
+                        }
+                    }
+                    None => {
+                        seen.insert(n.id.clone(), raw.len());
+                        raw.push((n, s));
+                    }
+                }
+            }
+        }
+
         // bm25 负分：绝对值越大越相关 → 归一化到 [0,1]。
         let best = raw.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
         let denom = if best.is_finite() {
@@ -1325,6 +1376,65 @@ impl Store {
         Ok(out)
     }
 
+    /// 记录（或覆写）节点 `id` 的语义文本标签。标签是空格分隔的短标签词，
+    /// 由大模型按检索成功时蒸馏写入，随后经 `search_scored` 汇入词法排名。
+    /// 幂等：同 `id` 重复写入覆盖旧值并刷新 `updated`。
+    pub fn tag_node(&self, id: &str, tags: &str, source: &str) -> Result<(), GraphError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO node_tags(id, tags, source, updated) VALUES(?1, ?2, ?3, ?4)\n             ON CONFLICT(id) DO UPDATE SET tags = excluded.tags, source = excluded.source, updated = excluded.updated",
+            rusqlite::params![id, tags, source, now],
+        )?;
+        // Метки одновременно индексируются в двух FTS-таблицах (porter + trigram),
+        // чтобы `search_scored` мог подмешивать их в MATCH при лексическом поиске.
+        // FTS5 не поддерживает PRIMARY KEY / ON CONFLICT → DELETE+INSERT (идемпотентно).
+        self.conn
+            .execute("DELETE FROM tag_fts WHERE id = ?1", rusqlite::params![id])?;
+        self.conn.execute(
+            "INSERT INTO tag_fts(id, tags) VALUES(?1, ?2)",
+            rusqlite::params![id, tags],
+        )?;
+        self.conn.execute(
+            "DELETE FROM tag_fts_cjk WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO tag_fts_cjk(id, tags) VALUES(?1, ?2)",
+            rusqlite::params![id, tags],
+        )?;
+        Ok(())
+    }
+
+    /// 全部节点标签：`(id, tags)`。诊断/测试用。
+    pub fn all_tags(&self) -> Result<Vec<(String, String)>, GraphError> {
+        let mut stmt = self.conn.prepare("SELECT id, tags FROM node_tags")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 尚未蒸馏标签的文件路径集合（去重），按路径排序。用于 explore 覆盖：
+    /// 仅把还没「理解过」的代码送给大模型评估，避免对已覆盖域重复花费。
+    pub fn uncovered_paths(&self) -> Result<Vec<String>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT n.path FROM nodes n\n             WHERE n.kind != 'file'\n               AND NOT EXISTS (SELECT 1 FROM node_tags t WHERE t.id = n.id)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// 全部边。
     pub fn all_edges(&self) -> Result<Vec<EdgeRec>, GraphError> {
         let mut stmt = self.conn.prepare("SELECT src, dst, kind FROM edges")?;
@@ -1424,14 +1534,27 @@ impl Store {
         )?;
         Ok(n as usize)
     }
+
+    /// 测试/回填专用：手写一条 `node_embeddings` 记录。生产代码不再经
+    /// [`insert_node`] 写入向量（embedding 已从 hot-path 摘除，表保留 dormant），
+    /// 此方法仅用于在测试里复现「已存在预计算嵌入」的兼容场景。
+    #[cfg(test)]
+    pub(crate) fn seed_embedding(
+        &self,
+        id: &str,
+        vec: &[f32],
+        model: &str,
+    ) -> Result<(), GraphError> {
+        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO node_embeddings(id, dim, model, embedding) VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![id, vec.len() as i64, model, blob.as_slice()],
+        )?;
+        Ok(())
+    }
 }
 
-fn insert_node(
-    conn: &Connection,
-    node: &Node,
-    embedder: Option<&dyn EmbeddingProvider>,
-    model: &str,
-) -> Result<(), GraphError> {
+fn insert_node(conn: &Connection, node: &Node) -> Result<(), GraphError> {
     conn.execute(
         "INSERT OR REPLACE INTO nodes(id, kind, name, path, start_line, end_line, signature, doc, score)\n         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
@@ -1454,22 +1577,8 @@ fn insert_node(
         "INSERT INTO symbol_fts_cjk(name, signature, doc, id, path) VALUES(?1, ?2, ?3, ?4, ?5)",
         (&node.name, &node.signature, &node.doc, &node.id, &node.path),
     )?;
-    // 写入即嵌入（仅符号节点；File 只有路径名，无语义价值）。
-    // 嵌入失败跳过——fail-open，下次刷新该文件时自愈重试。
-    if let Some(emb) = embedder {
-        if !matches!(node.kind, NodeKind::File) {
-            let text = format!("{}\n{}\n{}", node.name, node.signature, node.doc);
-            if let Ok(vec) = emb.embed(&text) {
-                let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-                conn.execute(
-                    "INSERT INTO node_embeddings(id, dim, model, embedding) VALUES(?1, ?2, ?3, ?4)\n                     ON CONFLICT(id) DO UPDATE SET dim = excluded.dim, model = excluded.model, embedding = excluded.embedding",
-                    (&node.id, vec.len() as i64, model, blob.as_slice()),
-                )?;
-            } else {
-                tracing::debug!(id = %node.id, "graph node embedding failed; node stays lexical-only");
-            }
-        }
-    }
+    // Вектора не пишутся: семантический слой переведён на distill-теги (node_tags),
+    // а embedding исключён из hot-path (см. docs/retrieval-rerank-distill-plan.md).
     Ok(())
 }
 
@@ -1763,6 +1872,31 @@ mod tests {
         // 因为写入文件本身必然成功）。
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
             let _ = f.set_modified(future);
+        }
+    }
+
+    /// 用 FakeEmbed 的确定性规则给 store 里全部**符号**节点预计算嵌入（模拟
+    /// 历史遗留的预计算向量；生产已不再经 refresh 写嵌入，且只嵌符号节点）。
+    fn seed_all_embeddings(store: &Store, model: &str) {
+        for n in store.all_nodes().unwrap() {
+            if matches!(n.kind, NodeKind::File) {
+                continue;
+            }
+            let name = n.name.to_lowercase();
+            let v: Vec<f32> = if name.contains("alpha") {
+                vec![1.0, 0.0]
+            } else if name.contains("beta") {
+                vec![0.6, 0.8]
+            } else if name.contains("gamma") {
+                vec![0.0, 1.0]
+            } else if name.contains("ferris") {
+                vec![0.9, 0.1]
+            } else if name.contains("needle") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            };
+            store.seed_embedding(&n.id, &v, model).unwrap();
         }
     }
 
@@ -2371,7 +2505,8 @@ require github.com/single/dep v1.0.0\n";
         .unwrap();
         store.refresh(root, 1_048_576).unwrap();
 
-        // 只嵌入符号节点（文件节点跳过）。
+        // 生产不再经 refresh 写嵌入；手动复现历史遗留的预计算向量。
+        seed_all_embeddings(&store, "test-model");
         assert_eq!(
             store.embedding_count().unwrap(),
             2,
@@ -2461,6 +2596,7 @@ require github.com/single/dep v1.0.0\n";
         )
         .unwrap();
         store.refresh(root, 1_048_576).unwrap();
+        seed_all_embeddings(&store, "test-model");
 
         // w=1.0：纯词法，顺序与 FTS 完全一致；语义独有命中（零分）被剔除。
         let pure_lex = store
@@ -2516,6 +2652,7 @@ require github.com/single/dep v1.0.0\n";
         )
         .unwrap();
         store.refresh(root, 1_048_576).unwrap();
+        seed_all_embeddings(&store, "test-model");
 
         for w in [0.0, 0.25, 0.5, 0.75, 1.0] {
             let bd = store
@@ -2582,6 +2719,7 @@ require github.com/single/dep v1.0.0\n";
         )
         .unwrap();
         store.refresh(root, 1_048_576).unwrap();
+        seed_all_embeddings(&store, "test-model");
 
         // 无 kind：语义独有命中 FerrisCrab 被召回。
         let all = store.search_hybrid("needle", None, 10).unwrap();
@@ -2802,5 +2940,106 @@ require github.com/single/dep v1.0.0\n";
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(files, 0, "已知旧版本库打开后应清空 files 强制全量重索引");
+    }
+
+    #[test]
+    fn tag_node_stores_and_updates_semantic_tags() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let db = root.join(".deepseeknova/graph.db");
+        let store = Store::open(&db).unwrap();
+
+        store
+            .tag_node("n1", "auth token refresh", "distill")
+            .unwrap();
+        store
+            .tag_node("n1", "auth oauth token refresh", "distill")
+            .unwrap();
+        store.tag_node("n2", "parser json", "distill").unwrap();
+
+        let tags = store.all_tags().unwrap();
+        assert_eq!(tags.len(), 2, "同 id 覆写，去重后应 2 条");
+        let n1 = tags.iter().find(|(id, _)| id == "n1").unwrap();
+        assert_eq!(n1.1, "auth oauth token refresh", "同 id 后写覆盖旧标签");
+    }
+
+    #[test]
+    fn tag_fts_lets_tag_only_node_be_recalled_lexically() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/a.rs",
+            "/// formatter helper\npub fn ferris_crab() {}\n",
+        );
+        let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
+        store.refresh(root, 1_048_576).unwrap();
+
+        // 蒸馏前：查询 "crab" 无法命中（doc/name 无共词）→ 纯词法找不到。
+        let before = store.search("crab", None, 10).unwrap();
+        let any_before = before.iter().any(|n| n.name == "ferris_crab");
+
+        // 给 ferris_crab 蒸馏标签 "crab rust parser"。
+        let target = store
+            .find_by_name("ferris_crab")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store
+            .tag_node(&target.id, "crab rust parser", "distill")
+            .unwrap();
+
+        let after = store.search("crab", None, 10).unwrap();
+        assert!(
+            after.iter().any(|n| n.name == "ferris_crab"),
+            "标签命中后应经 tag_fts 召回: before={any_before}, after={:?}",
+            after.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn uncovered_paths_lists_only_untagged_nodes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.rs", "pub fn alpha() {}\npub fn beta() {}\n");
+        let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
+        store.refresh(root, 1_048_576).unwrap();
+
+        let paths = store.uncovered_paths().unwrap();
+        assert_eq!(
+            paths,
+            vec!["src/a.rs".to_string()],
+            "未蒸馏前路径应全部覆盖"
+        );
+
+        // 蒸馏 alpha 后该文件路径仍出现（beta 未蒸馏）——uncovered 按文件粒度
+        // 只要还有未标记节点即保留。
+        let alpha = store
+            .find_by_name("alpha")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store
+            .tag_node(&alpha.id, "alpha helper", "distill")
+            .unwrap();
+        assert_eq!(
+            store.uncovered_paths().unwrap(),
+            vec!["src/a.rs".to_string()],
+            "文件内仍有未标记节点时路径应保留"
+        );
+
+        let beta = store
+            .find_by_name("beta")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store.tag_node(&beta.id, "beta helper", "distill").unwrap();
+        assert!(
+            store.uncovered_paths().unwrap().is_empty(),
+            "全部节点标记后应无未覆盖路径"
+        );
     }
 }

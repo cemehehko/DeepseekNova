@@ -131,6 +131,19 @@ impl GraphIndex {
             .search_hybrid_with_weight(query, kind, limit, weight)
     }
 
+    /// 混合检索的分数分解（诊断用）：额外暴露 `bm25` / `cosine` 两加性分量，
+    /// 结果集/排序/总分与 [`Self::search_hybrid_with_weight`] 完全一致。
+    pub fn search_hybrid_breakdown(
+        &self,
+        query: &str,
+        kind: Option<NodeKind>,
+        limit: usize,
+        weight: f64,
+    ) -> Result<Vec<store::HybridHit>, GraphError> {
+        self.store
+            .search_hybrid_breakdown(query, kind, limit, weight)
+    }
+
     /// BFS 邻居遍历：沿 `kinds`（空=全部边类型）按 `dir` 方向最多 `hops` 跳，
     /// 去重且排除起点，按 PageRank score 降序返回。
     pub fn neighbors(
@@ -209,6 +222,36 @@ impl GraphIndex {
     /// 某源码文件所属最近清单的外部依赖名。
     pub fn external_deps_for_file(&self, file_path: &str) -> Result<Vec<String>, GraphError> {
         self.store.external_deps_for_file(file_path)
+    }
+
+    /// 全部索引节点（诊断/rerank 候选集用；大项目注意内存）。已按 PageRank
+    /// score 降序返回。
+    pub fn all_nodes(&self) -> Result<Vec<Node>, GraphError> {
+        self.store.all_nodes()
+    }
+
+    /// 记录（或覆写）节点 `id` 的语义文本标签（空格分隔短标签）。由大模型在
+    /// 检索成功时蒸馏写入，随后汇入词法检索（`tag_fts`）。幂等。`source` 用于
+    /// 审计（如 `"distill"` / `"manual"`）。
+    pub fn tag_node(&self, id: &str, tags: &str, source: &str) -> Result<(), GraphError> {
+        self.store.tag_node(id, tags, source)
+    }
+
+    /// 尚未蒸馏标签的文件路径集合（去重、排序）。用于 explore 覆盖：只把还没
+    /// 「理解过」的代码交给大模型评估，避免对已覆盖域重复花费。
+    pub fn uncovered_paths(&self) -> Result<Vec<String>, GraphError> {
+        self.store.uncovered_paths()
+    }
+
+    /// 测试专用：手写预计算嵌入（生产不再写入，见 `Store::seed_embedding`）。
+    #[cfg(test)]
+    pub(crate) fn seed_embedding(
+        &self,
+        id: &str,
+        vec: &[f32],
+        model: &str,
+    ) -> Result<(), GraphError> {
+        self.store.seed_embedding(id, vec, model)
     }
 
     /// token 预算内的 repo map；personalization 为种子符号名/路径。
@@ -690,6 +733,22 @@ mod tests {
         .unwrap();
         idx.refresh().unwrap();
 
+        // 生产已不再经 refresh 预计算嵌入；这里复现「已有预计算嵌入」场景，
+        // 以覆盖 hybrid 融合路径（node_embeddings 表保持 dormant）。
+        {
+            let nodes = idx.all_nodes().unwrap();
+            for n in &nodes {
+                let v: Vec<f32> = if n.name.contains("ferris") {
+                    vec![0.9, 0.1]
+                } else if n.name.contains("needle") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                idx.seed_embedding(&n.id, &v, "test-model").unwrap();
+            }
+        }
+
         let plain = idx.search("needle", None, 10).unwrap();
         assert!(
             plain.iter().all(|n| n.name != "ferris_crab"),
@@ -722,6 +781,20 @@ mod tests {
         )
         .unwrap();
         idx.refresh().unwrap();
+
+        {
+            let nodes = idx.all_nodes().unwrap();
+            for n in &nodes {
+                let v: Vec<f32> = if n.name.contains("ferris") {
+                    vec![0.9, 0.1]
+                } else if n.name.contains("needle") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                idx.seed_embedding(&n.id, &v, "test-model").unwrap();
+            }
+        }
 
         assert!(idx.has_embedder());
         // 纯词法不得召回语义命中。
