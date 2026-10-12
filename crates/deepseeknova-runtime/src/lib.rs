@@ -71,7 +71,11 @@ read_file once the target is confirmed;\n\
 \n\
 When a bug lives in a known subsystem, give `search_code` the crate/subsystem\n\
 domain as terms (e.g. `[\"tui\", \"status\"]`) rather than a single broad word\n\
-like `model`, which floods results from unrelated crates.";
+like `model`, which floods results from unrelated crates.\n\
+\n\
+Prefer a scoped `grep` (set `path` to the specific crate or module) or\n\
+`search_code` over `bash` grep across the repo root (`.`). Root-wide greps\n\
+are slow, noisy, and burn steps; constrain the search area before running one.";
 
 /// 设计 C：运行时「会话边界」序号。每次 `build_agent` 递增一次，用作
 /// skill `record_use` 的会话 id——每次构造 = 新会话，跨 build 的 recall

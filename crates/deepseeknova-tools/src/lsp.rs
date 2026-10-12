@@ -181,7 +181,7 @@ impl Tool for LspDiagnosticsTool {
         session.shutdown().await;
         let diagnostics = result?;
 
-        Ok(format_diagnostics(&path, &diagnostics))
+        Ok(format_diagnostics(&path, &diagnostics, &text))
     }
 }
 
@@ -529,18 +529,34 @@ fn severity_label(severity: u8) -> &'static str {
     }
 }
 
-fn format_diagnostics(path: &Path, diagnostics: &[LspDiagnostic]) -> String {
+/// 每条诊断周围带出的上下文行数（两侧各 N 行），供模型理解告警成因。
+/// 这是「L-средне」级别的反馈宽度：消息 + 邻近行，而非整个文件。
+const CONTEXT_LINES: usize = 2;
+
+fn format_diagnostics(path: &Path, diagnostics: &[LspDiagnostic], text: &str) -> String {
     if diagnostics.is_empty() {
         return format!("No LSP diagnostics for {}.", path.display());
     }
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = format!("LSP diagnostics for {}:\n", path.display());
     for d in diagnostics {
         out.push_str(&format!(
-            "- {}: {} (line {})\n",
+            "  {} (line {}): {}\n",
             severity_label(d.severity),
-            d.message,
-            d.line
+            d.line,
+            d.message
         ));
+        // 邻近行上下文（1-based → 0-based 索引），帮助定位而无需重读整个文件。
+        let center = d.line.saturating_sub(1) as usize;
+        let start = center.saturating_sub(CONTEXT_LINES);
+        let end = (center + CONTEXT_LINES + 1).min(lines.len());
+        if start < lines.len() {
+            for (idx, l) in lines[start..end].iter().enumerate() {
+                let lineno = start + idx + 1;
+                out.push_str(&format!("{:>5} | {}\n", lineno, l));
+            }
+        }
+        out.push('\n');
     }
     out.trim_end().to_string()
 }
@@ -637,10 +653,17 @@ mod tests {
                 line: 1,
             },
         ];
-        let out = format_diagnostics(Path::new("src/main.rs"), &diags);
-        assert!(out.contains("error: expected `;` (line 5)"));
-        assert!(out.contains("warning: unused variable (line 1)"));
-        let empty = format_diagnostics(Path::new("src/main.rs"), &[]);
+        let text =
+            "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\nfn five() {}\nfn six() {}\n";
+        let out = format_diagnostics(Path::new("src/main.rs"), &diags, text);
+        assert!(out.contains("error (line 5): expected `;`"));
+        assert!(out.contains("warning (line 1): unused variable"));
+        // 邻近行上下文应出现在提示里（line 5 → 3..=7 附近）。
+        assert!(
+            out.contains("3 | fn three()"),
+            "должен показывать соседние строки: {out}"
+        );
+        let empty = format_diagnostics(Path::new("src/main.rs"), &[], text);
         assert!(empty.contains("No LSP diagnostics"));
     }
 

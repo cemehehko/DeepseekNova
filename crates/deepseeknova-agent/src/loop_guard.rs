@@ -97,6 +97,36 @@ fn extract_path(args_json: &str) -> Option<String> {
     }
 }
 
+/// 判断一条 `bash` 命令是否为「跨仓库根目录的宽泛 grep/find」——
+/// 即 `grep -rn … .` / `find … .` 这类未限定 `path`、扫全仓的搜索。
+/// 这类调用慢且噪音大，是步骤浪费的常见来源；命中则在 hint 中提点模型。
+fn is_wide_repo_search(command: &str) -> bool {
+    let c = command.trim();
+    // 必须是 grep/find/ag/rg 形态（含经管道前置 `grep -rn`）。
+    let is_search = c.contains("grep -r")
+        || c.contains("rgrep")
+        || c.contains("find ")
+        || c.contains("rg ")
+        || c.contains("ag ");
+    if !is_search {
+        return false;
+    }
+    // 目标目录为根（`.` 或 `./` 或整仓无路径限定）→ 宽泛。
+    // 有明确子目录/crate 路径（如 `crates/…`、`src/…`、`--include` 且带 path）
+    // 视为可接受范围。
+    let ends_root = c.contains(" .")
+        || c.ends_with(" .")
+        || c.contains(" . |")
+        || c.ends_with(".")
+        || c.contains("' .'")
+        || c.contains("\" .\"");
+    if ends_root {
+        return true;
+    }
+    // `find crates/...` 之类带明确路径 → 不算宽泛；但 `find .` 算。
+    false
+}
+
 /// 递归规范化 JSON 值：排序对象键、丢弃易变键。返回值用于哈希。
 fn normalize_args(value: &Value) -> Value {
     match value {
@@ -164,6 +194,8 @@ pub struct LoopGuard {
     warn_episodes: u64,
     /// 当前停滞段是否已计入 `warn_episodes`（防同一段内重复计数）。
     episode_warned: bool,
+    /// 本段内宽泛全仓搜索（bash grep/find 扫根目录）的次数。
+    wide_search_count: u64,
     /// 解析后的进展工具集合（含内置默认 + 显式配置）。
     progress_tools: HashMap<String, ()>,
 }
@@ -189,6 +221,7 @@ impl LoopGuard {
             read_path_counts: HashMap::new(),
             warn_episodes: 0,
             episode_warned: false,
+            wide_search_count: 0,
             progress_tools,
         }
     }
@@ -217,6 +250,17 @@ impl LoopGuard {
             if let Some(p) = extract_path(args_json) {
                 *self.read_path_counts.entry(p).or_insert(0) += 1;
             }
+        }
+
+        // bash：统计宽泛全仓搜索（grep/find 扫根目录），供 hint 提点收敛搜索域。
+        let is_wide = tool_name == "bash"
+            && serde_json::from_str::<Value>(args_json)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned))
+                .map(|cmd| is_wide_repo_search(&cmd))
+                .unwrap_or(false);
+        if is_wide {
+            self.wide_search_count += 1;
         }
 
         let mut warning: Option<LoopGuardWarning> = None;
@@ -262,6 +306,7 @@ impl LoopGuard {
             self.steps_without_progress = 0;
             self.stagnant_warned = false;
             self.episode_warned = false;
+            self.wide_search_count = 0;
         } else {
             self.steps_without_progress += 1;
             let threshold = settings.max_steps_without_progress.max(1) as u64;
@@ -307,7 +352,16 @@ impl LoopGuard {
                     .push_str(&format!(" 重读文件: {}.", names.join(", ")));
             }
 
-            // 2) 再犯（≥2 次告警段）→ 强制重规划文案。
+            // 2) 宽泛全仓搜索过多 → 提点收敛搜索域。
+            if self.wide_search_count >= 2 {
+                w.hint.push_str(&format!(
+                    " 已做 {} 次宽泛全仓 grep/find（扫根目录 `.`）；\
+                     请改用带 `path` 的 grep（限定到具体 crate/模块）或 search_code。",
+                    self.wide_search_count
+                ));
+            }
+
+            // 3) 再犯（≥2 次告警段）→ 强制重规划文案。
             if self.warn_episodes >= 2 {
                 w.hint.push_str(
                     " [ESCALATION] 你已连续两次停滞 — 停止继续读，明确说出你打算改哪个\
@@ -560,5 +614,19 @@ mod tests {
             "второй эпизод должен эскалировать: {}",
             w2.hint
         );
+    }
+
+    #[test]
+    fn wide_repo_search_detection() {
+        // 扫根目录 → wide。
+        assert!(is_wide_repo_search("grep -rn \"foo\" --include=*.rs ."));
+        assert!(is_wide_repo_search("find . -name '*.rs'"));
+        assert!(is_wide_repo_search("grep -rn foo . | head -50"));
+        // 限定路径 → 不算 wide。
+        assert!(!is_wide_repo_search("grep -rn foo crates/deepseeknova-tui"));
+        assert!(!is_wide_repo_search("find crates -name '*.rs'"));
+        assert!(!is_wide_repo_search("echo hello"));
+        // 非搜索命令 → 不算。
+        assert!(!is_wide_repo_search("git status --short"));
     }
 }

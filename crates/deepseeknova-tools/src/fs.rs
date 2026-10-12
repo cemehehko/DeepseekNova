@@ -403,6 +403,12 @@ impl Tool for EditFileTool {
                     i + 1
                 )));
             }
+            if b.search == b.replace {
+                return Err(deepseeknova_core::DeepseeknovaError::tool(format!(
+                    "edit block #{}: no-op — `search` equals `replace`, file content unchanged",
+                    i + 1
+                )));
+            }
             let count = working.matches(&b.search).count();
             if count == 0 {
                 return Err(deepseeknova_core::DeepseeknovaError::tool(format!(
@@ -764,6 +770,22 @@ mod tests {
         assert!(res.is_err(), "ambiguous block must fail whole call");
         let after = tokio::fs::read_to_string(dir.join("e.rs")).await.unwrap();
         assert_eq!(after, "dup\ndup\nkeep\n", "no partial edit");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_noop_search_equals_replace_fails() {
+        let dir = std::env::temp_dir().join(format!("dnv-c1-editnoop-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let (sid, ctx) = seed_edit(&dir, "hello world\n").await;
+        // search == replace → 必须失败，不能报 `applied` 而文件未变。
+        let args = format!(
+            r#"{{\"path\":\"e.rs\",\"snippet_id\":\"{sid}\",\"search\":\"world\",\"replace\":\"world\"}}"#
+        );
+        let res = EditFileTool::new().execute(&ctx, &args).await;
+        assert!(res.is_err(), "search==replace must be rejected as no-op");
+        let after = tokio::fs::read_to_string(dir.join("e.rs")).await.unwrap();
+        assert_eq!(after, "hello world\n", "file must be unchanged");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
