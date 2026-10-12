@@ -96,7 +96,7 @@ fn names(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// 4 个内置预设。工具名对应真实 schema 名（read_file/bash/search_code…）；均不含 delegate。
+/// 4 个内置预设。工具名对应真实 schema 名（read_file/bash/grep…）；均不含 delegate。
 pub fn builtin_presets() -> Vec<DelegatePreset> {
     vec![
         DelegatePreset::simple(
@@ -104,14 +104,13 @@ pub fn builtin_presets() -> Vec<DelegatePreset> {
             "You are an explorer sub-agent operating in the Observe phase of the \
                 Observe → Plan → Tool → Verify → Reflect → Next Action loop. Investigate and \
                 locate relevant code/facts read-only. Prefer graph tools \
-                (search_code/traverse_graph/retrieve_entity) over full-file reads. Output \
-                contract: return a concise findings summary with file:line evidence.",
+                (grep mode=symbols / traverse_graph / retrieve_entity) over full-file reads. \
+                Output contract: return a concise findings summary with file:line evidence.",
             names(&[
                 "read_file",
                 "ls",
                 "glob",
                 "grep",
-                "search_code",
                 "traverse_graph",
                 "retrieve_entity",
                 "recall",
@@ -134,7 +133,6 @@ pub fn builtin_presets() -> Vec<DelegatePreset> {
                 "glob",
                 "grep",
                 "bash",
-                "search_code",
                 "traverse_graph",
                 "retrieve_entity",
             ]),
@@ -159,7 +157,6 @@ pub fn builtin_presets() -> Vec<DelegatePreset> {
                 "ls",
                 "glob",
                 "grep",
-                "search_code",
                 "traverse_graph",
                 "retrieve_entity",
             ]),
@@ -786,7 +783,6 @@ mod tests {
                     "ls",
                     "glob",
                     "grep",
-                    "search_code",
                     "traverse_graph",
                     "retrieve_entity",
                     "recall",
@@ -804,7 +800,6 @@ mod tests {
                     "glob",
                     "grep",
                     "bash",
-                    "search_code",
                     "traverse_graph",
                     "retrieve_entity",
                 ][..],
@@ -817,7 +812,6 @@ mod tests {
                     "ls",
                     "glob",
                     "grep",
-                    "search_code",
                     "traverse_graph",
                     "retrieve_entity",
                 ][..],

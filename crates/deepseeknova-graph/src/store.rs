@@ -1419,6 +1419,20 @@ impl Store {
         Ok(out)
     }
 
+    /// 指定文件路径（相对工作区）内、已有蒸馏标签的非-文件节点数。
+    ///
+    /// 语义：`edit_file` 之后，「该文件已被理解过的程度」——用于决定是否
+    /// 提示模型补做 `tag_code`（只在标签少/无时才扰，避免对已覆盖代码重复
+    /// 蒸馏花费）。路径按子串后缀匹配（`nodes.path` 存的是相对路径，与
+    /// `extract_tool_path` 产物同构）。
+    pub fn tagged_count_for_file(&self, path: &str) -> Result<usize, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*)\n             FROM nodes n\n             JOIN node_tags t ON t.id = n.id\n             WHERE n.kind != 'file'\n               AND n.path = ?1",
+        )?;
+        let count: i64 = stmt.query_row(rusqlite::params![path], |r| r.get(0))?;
+        Ok(count as usize)
+    }
+
     /// 尚未蒸馏标签的文件路径集合（去重），按路径排序。用于 explore 覆盖：
     /// 仅把还没「理解过」的代码送给大模型评估，避免对已覆盖域重复花费。
     pub fn uncovered_paths(&self) -> Result<Vec<String>, GraphError> {
@@ -3104,6 +3118,33 @@ require github.com/single/dep v1.0.0\n";
             store.uncovered_paths().unwrap().is_empty(),
             "全部节点标记后应无未覆盖路径"
         );
+    }
+
+    #[test]
+    fn tagged_count_for_file_counts_tagged_nonfile_nodes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.rs", "pub fn alpha() {}\npub fn beta() {}\n");
+        let mut store = Store::open(&root.join(".deepseeknova/graph.db")).unwrap();
+        store.refresh(root, 1_048_576).unwrap();
+
+        // 两个符号节点均未标记 → count 0。
+        assert_eq!(store.tagged_count_for_file("src/a.rs").unwrap(), 0);
+
+        // 标记 alpha → count 1。
+        let alpha = store
+            .find_by_name("alpha")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store
+            .tag_node(&alpha.id, "alpha helper", "distill")
+            .unwrap();
+        assert_eq!(store.tagged_count_for_file("src/a.rs").unwrap(), 1);
+
+        // 路径不存在 → count 0（不报错）。
+        assert_eq!(store.tagged_count_for_file("src/nope.rs").unwrap(), 0);
     }
 
     #[test]

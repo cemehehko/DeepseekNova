@@ -249,6 +249,12 @@ impl GraphIndex {
         self.store.uncovered_paths()
     }
 
+    /// 指定文件内、已有蒸馏标签的非-文件节点数（`edit_file` 后据此决定是否
+    /// 提示模型补做 `tag_code`）。返回 0 表示该文件尚无任何语义标签。
+    pub fn tagged_count_for_file(&self, path: &str) -> Result<usize, GraphError> {
+        self.store.tagged_count_for_file(path)
+    }
+
     /// Explore-кандидаты для blind-gap：по непокрытым путям, равномерно **по
     /// crate** (не по узлу), до `budget` узлов, внутри crate — топ по PageRank
     /// (`per_crate` на crate). Подмешиваются в `search_code` вместе с BM25 top-K,

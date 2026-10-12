@@ -1200,6 +1200,121 @@ async fn post_edit_lsp_unavailability_notice_is_injected() {
 }
 
 #[tokio::test]
+async fn post_edit_distill_hint_injected_when_file_has_few_tags() {
+    // 编辑后的自动蒸馏提示：write_file 成功 → 调 tag_status → 返回 0（无标签）
+    // → 注入 `[distill hint]`，引导模型对刚改动的符号做 tag_code。
+    let write = Arc::new(SpyTool {
+        name: "write_file",
+        result: "wrote ok".into(),
+    });
+    let tag_status = Arc::new(SpyTool {
+        name: "tag_status",
+        result: "tagged symbols in 'src/a.rs': 0".into(),
+    });
+    let responses = vec![
+        vec![
+            Chunk::ToolCallStart {
+                id: "call_1".into(),
+                name: "write_file".into(),
+            },
+            Chunk::ToolCallEnd {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            },
+            Chunk::Done,
+        ],
+        vec![
+            Chunk::TextDelta("done".into()),
+            Chunk::Usage(Usage::default()),
+            Chunk::Done,
+        ],
+    ];
+    let provider = Arc::new(MockProvider::sequential(responses));
+    let mut agent = Agent::new(provider, 5);
+    agent.register_tool(write);
+    agent.register_tool(tag_status);
+
+    let mut stream = agent
+        .run_stream(RunInput {
+            prompt: "write a file".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    let mut injected = false;
+    while let Some(event) = stream.next().await {
+        if let Ok(RunEvent::ToolResult { result, .. }) = event {
+            if result.contains("[distill hint]") && result.contains("tag_code") {
+                injected = true;
+            }
+        }
+    }
+    assert!(
+        injected,
+        "untagged file edit must trigger a tag_code distill hint in ToolResult"
+    );
+}
+
+#[tokio::test]
+async fn post_edit_distill_hint_skipped_when_file_already_tagged() {
+    // 文件已有较多标签（> DISTILL_HINT_MAX_TAGS）→ 不注入提示，避免重复花费。
+    let write = Arc::new(SpyTool {
+        name: "write_file",
+        result: "wrote ok".into(),
+    });
+    let tag_status = Arc::new(SpyTool {
+        name: "tag_status",
+        result: "tagged symbols in 'src/a.rs': 7".into(),
+    });
+    let responses = vec![
+        vec![
+            Chunk::ToolCallStart {
+                id: "call_1".into(),
+                name: "write_file".into(),
+            },
+            Chunk::ToolCallEnd {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            },
+            Chunk::Done,
+        ],
+        vec![
+            Chunk::TextDelta("done".into()),
+            Chunk::Usage(Usage::default()),
+            Chunk::Done,
+        ],
+    ];
+    let provider = Arc::new(MockProvider::sequential(responses));
+    let mut agent = Agent::new(provider, 5);
+    agent.register_tool(write);
+    agent.register_tool(tag_status);
+
+    let mut stream = agent
+        .run_stream(RunInput {
+            prompt: "write a file".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    let mut injected = false;
+    while let Some(event) = stream.next().await {
+        if let Ok(RunEvent::ToolResult { result, .. }) = event {
+            if result.contains("[distill hint]") {
+                injected = true;
+            }
+        }
+    }
+    assert!(
+        !injected,
+        "already-tagged file must not trigger a distill hint"
+    );
+}
+
+#[tokio::test]
 async fn auto_router_decides_once_per_run_and_routes_all_steps() {
     let spy = Arc::new(SpyTool {
         name: "spy",

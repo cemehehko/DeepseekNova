@@ -214,7 +214,7 @@ async fn build_agent_wires_graph_when_enabled() {
     let provider = std::sync::Arc::new(stub_provider());
     let agent = build_agent(&config, root.clone(), provider, 5, None, vec![]).unwrap();
     let names = agent.tool_names();
-    assert!(names.iter().any(|n| n == "search_code"));
+    assert!(names.iter().any(|n| n == "grep"));
     assert!(names.iter().any(|n| n == "traverse_graph"));
     assert!(names.iter().any(|n| n == "retrieve_entity"));
     assert!(names.iter().any(|n| n == "trace_code"));
@@ -380,7 +380,6 @@ fn build_agent_skips_graph_when_disabled() {
     config.graph.enabled = false;
     let provider = std::sync::Arc::new(stub_provider());
     let agent = build_agent(&config, std::env::temp_dir(), provider, 5, None, vec![]).unwrap();
-    assert!(!agent.tool_names().iter().any(|n| n == "search_code"));
     assert!(!agent.tool_names().iter().any(|n| n == "traverse_graph"));
     assert!(!agent.tool_names().iter().any(|n| n == "retrieve_entity"));
     assert!(!agent.tool_names().iter().any(|n| n == "trace_code"));
@@ -907,9 +906,13 @@ fn mid_run_config_on_wires_retrieval() {
 
 #[test]
 fn graph_retrieval_hint_stays_english_and_graph_first() {
-    for tool in ["search_code", "traverse_graph", "retrieve_entity"] {
+    for tool in ["grep", "traverse_graph", "retrieve_entity", "tag_code"] {
         assert!(GRAPH_RETRIEVAL_HINT.contains(tool), "hint missing {tool}");
     }
+    assert!(
+        GRAPH_RETRIEVAL_HINT.contains("mode=symbols"),
+        "hint must teach symbols mode"
+    );
     assert!(
         !GRAPH_RETRIEVAL_HINT.contains("检索"),
         "hint must be English, not Chinese"
@@ -1733,7 +1736,7 @@ fn build_agent_wires_verify_with_command() {
 }
 
 /// disabled-set 过滤与 graph 开关叠加：graph 启用但 tools.overrides
-/// 禁用 search_code 时，该工具仍被剔除（overrides 与功能开关两路
+/// 禁用 traverse_graph 时，该工具仍被剔除（overrides 与功能开关两路
 /// disabled 集合合并，模型看不到被禁 schema）。
 #[tokio::test]
 async fn build_agent_disables_graph_tool_via_overrides_even_when_graph_enabled() {
@@ -1741,7 +1744,7 @@ async fn build_agent_disables_graph_tool_via_overrides_even_when_graph_enabled()
     config.graph.enabled = true;
     config.memory.enabled = false;
     config.tools.overrides = vec![deepseeknova_config::ToolOverride {
-        name: "search_code".into(),
+        name: "traverse_graph".into(),
         disabled: true,
         timeout_secs: None,
         max_file_size: None,
@@ -1750,11 +1753,11 @@ async fn build_agent_disables_graph_tool_via_overrides_even_when_graph_enabled()
     let agent = build_agent(&config, std::env::temp_dir(), provider, 5, None, vec![]).unwrap();
     let names = agent.tool_names();
     assert!(
-        !names.iter().any(|n| n == "search_code"),
+        !names.iter().any(|n| n == "traverse_graph"),
         "overrides 禁用必须叠加到 graph 启用的工具集，实得: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n == "traverse_graph"),
+        names.iter().any(|n| n == "retrieve_entity"),
         "其他图工具仍保留"
     );
 }

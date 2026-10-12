@@ -356,7 +356,7 @@ impl LoopGuard {
             if self.wide_search_count >= 2 {
                 w.hint.push_str(&format!(
                     " 已做 {} 次宽泛全仓 grep/find（扫根目录 `.`）；\
-                     请改用带 `path` 的 grep（限定到具体 crate/模块）或 search_code。",
+                     请改用带 `path` 的 grep（限定到具体 crate/模块）或 grep mode=symbols。",
                     self.wide_search_count
                 ));
             }
@@ -365,8 +365,8 @@ impl LoopGuard {
             if self.warn_episodes >= 2 {
                 w.hint.push_str(
                     " [ESCALATION] 你已连续两次停滞 — 停止继续读，明确说出你打算改哪个\
-                     文件/函数；若尚未定位，请用 search_code 加更精确的 terms（含 crate/\
-                     子域，如 [\"tui\",\"status\"]）重新检索，而不是读无关文件。",
+                     文件/函数；若尚未定位，请用 grep mode=symbols 加更精确的 terms（含 \
+                     crate/子域，如 [\"tui\",\"status\"]）重新检索，而不是读无关文件。",
                 );
             }
 

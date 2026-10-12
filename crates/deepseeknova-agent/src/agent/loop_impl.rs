@@ -80,6 +80,18 @@ const PAUSE_FIX_PLAN_CAP: usize = 200;
 /// （确定性提示"最小改动"，替代提示词层职责）。git 仓库内生效。
 const DIFF_AUDIT_MAX_CHANGED_LINES: usize = 300;
 
+/// 自动蒸馏提示的标签覆盖阈值：文件内已蒸馏符号数 ≤ 此值即提示 `tag_code`。
+/// 「该文件基本未被理解过」→ 值得提示；超过则视为已覆盖，不扰。
+const DISTILL_HINT_MAX_TAGS: usize = 2;
+
+/// 从 `tag_status` 输出（形如 `tagged symbols in 'x': N`）解析已标记数。
+/// 解析失败返回 `None`（调用方静默跳过，不外抛错误）。
+fn parse_tagged_count(status: &str) -> Option<usize> {
+    // 期望形态 "tagged symbols in '<path>': <n>"。取最后一个 ':' 后的数字。
+    let tail = status.rsplit_once(':')?.1.trim();
+    tail.parse::<usize>().ok()
+}
+
 /// A4：统计 diff 文本的变更行数（`+`/`-` 打头的行，排除 `+++`/`---`
 /// 文件头）。纯函数，便于单测。
 fn changed_line_count(diff: &str) -> usize {
@@ -2049,6 +2061,41 @@ async fn stream_and_process_turn(
                         }
                     }
                 }
+                // ── 自动蒸馏提示：对已确认的 `edit_file`/`write_file` 目标，若该
+                // 文件在代码图中尚无（或极少）语义标签，注入一次 `tag_code` 提示，
+                // 让模型把刚用过/改动的关键符号蒸馏进图（供下次词法召回）。只在
+                // 标签少/无时扰，避免对已充分蒸馏的代码重复花费。tag_status 缺
+                // 失（graph 未启用）时静默跳过。
+                if executed[i]
+                    && matches!(call.name.as_str(), "edit_file" | "write_file")
+                    && !is_tool_error_result(&result)
+                {
+                    if let Some(ts) = tool_map.get("tag_status") {
+                        if let Some(path) = extract_tool_path(&call.arguments) {
+                            let ts_ctx = build_tool_context(
+                                "tag-status-post-edit",
+                                cancel.child_token(),
+                                workspace_root,
+                                security,
+                                extensions,
+                            );
+                            let ts_args = serde_json::json!({ "path": path }).to_string();
+                            if let Ok(status) = ts.execute(&ts_ctx, &ts_args).await {
+                                if let Some(n) = parse_tagged_count(&status) {
+                                    if n <= DISTILL_HINT_MAX_TAGS {
+                                        result.push_str(&format!(
+                                            "\n\n---\n[distill hint] '{}' has {} tagged symbol(s) \
+                                             in the code graph; consider distilling the symbols \
+                                             you just worked with via `tag_code` so they stay \
+                                             findable next time.",
+                                            path, n
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // A4：写后 diff 规模审计（git 仓库内，可配置默认关）。变更行数
                 // 超阈值 → 告警注入 ToolResult（确定性提示"最小改动"，替代提示词
                 // 层 Make Focused Progress 职责）。非 git 仓库 collect_diff 返回
@@ -2438,6 +2485,18 @@ mod tests {
         assert_eq!(changed_line_count("@@ -1 +1 @@\n context\n"), 0);
         // 文件头 +++/--- 不得计入。
         assert_eq!(changed_line_count("--- a\n+++ b\n"), 0);
+    }
+
+    /// tag_status 输出解析：从 `tagged symbols in 'x': N` 中提取 N。
+    #[test]
+    fn parse_tagged_count_reads_number_after_colon() {
+        assert_eq!(
+            parse_tagged_count("tagged symbols in 'src/a.rs': 3"),
+            Some(3)
+        );
+        assert_eq!(parse_tagged_count("tagged symbols in 'x': 0"), Some(0));
+        assert_eq!(parse_tagged_count("no index message"), None);
+        assert_eq!(parse_tagged_count("tagged symbols in 'x': abc"), None);
     }
     use std::sync::Arc;
 

@@ -411,7 +411,7 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                         }
                     }
                 }
-                let graph_tools = ["search_code", "traverse_graph", "retrieve_entity"];
+                let graph_tools = ["traverse_graph", "retrieve_entity"];
                 for tool in deepseeknova_tools::all_builtin_tools() {
                     if !config.graph.enabled && graph_tools.contains(&tool.schema().name.as_str()) {
                         continue;

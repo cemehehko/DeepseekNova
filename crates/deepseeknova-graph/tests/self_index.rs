@@ -44,7 +44,7 @@ fn self_index_finds_known_symbols() {
     );
     assert!(report.nodes > 100, "expected a non-trivial node count");
 
-    // 成功标准 2：search_code("PermissionGate") 首位命中定义实体
+    // 成功标准 2：grep symbols("PermissionGate") 首位命中定义实体
     let hits = idx.search("PermissionGate", None, 10).expect("search");
     assert!(!hits.is_empty(), "PermissionGate should be found");
     // 注：`hits[0]` 验证 exact-partition（精确名置顶），非 BM25 排序；真实仓

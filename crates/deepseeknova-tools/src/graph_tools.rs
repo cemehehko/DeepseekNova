@@ -1,5 +1,5 @@
-//! 图检索工具：search_code / traverse_graph / retrieve_entity /
-//! trace_code / impact_code / explore_code / deps_code。
+//! 图检索工具：traverse_graph / retrieve_entity / trace_code / impact_code /
+//! explore_code / deps_code。`search_code` 已并入 `grep`（`mode: symbols`）。
 //! 索引句柄经 `ToolContext.extensions` 注入（`GraphHandle`），缺失时优雅降级。
 
 use async_trait::async_trait;
@@ -14,7 +14,8 @@ use std::sync::Arc;
 pub type GraphHandle = std::sync::Arc<std::sync::Mutex<deepseeknova_graph::GraphIndex>>;
 
 /// 索引缺失时的降级提示。
-const NO_INDEX_MSG: &str = "代码图索引构建中或未启用，请改用 grep 检索。";
+const NO_INDEX_MSG: &str =
+    "code graph index unavailable; semantic search degraded (search text only).";
 
 /// 从 ctx.extensions 取索引句柄（缺失返回 None，调用方降级）。
 fn graph_handle(ctx: &ToolContext) -> Option<GraphHandle> {
@@ -25,7 +26,7 @@ fn graph_handle(ctx: &ToolContext) -> Option<GraphHandle> {
 fn graph_error_message(action: &str, err: &GraphError) -> String {
     match err {
         GraphError::EntityNotFound(name) => {
-            format!("entity '{name}' not found; try search_code first.")
+            format!("entity '{name}' not found; try grep mode=symbols first.")
         }
         GraphError::IndexBusy => {
             format!("code graph is refreshing while {action}; retry shortly or use grep.")
@@ -47,169 +48,113 @@ fn lock_index(
         .map_err(|_| DeepseeknovaError::tool("graph index lock poisoned".to_string()))
 }
 
-/// 按符号名或关键字在代码图中检索函数/结构体/trait 等实体（`search_code`）。
-pub struct SearchCodeTool;
+/// 语义图搜索核心（`grep` 的 `symbols`/`all` 模式的底层实现）。返回给模型
+/// 的文本行列表：BM25 命中 + explore 盲区候选。抽取为独立助手，供 `grep`
+/// （同 crate）复用而无需复制逻辑；`search_code` 工具已并入 `grep`。
+pub(crate) async fn graph_search_terms(
+    ctx: &ToolContext,
+    terms: &[String],
+    kind: Option<NodeKind>,
+    and_mode: bool,
+    limit: usize,
+) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+    let handle = match graph_handle(ctx) {
+        Some(h) => h,
+        None => return Ok(NO_INDEX_MSG.to_string()),
+    };
 
-#[derive(Deserialize)]
-struct SearchCodeArgs {
-    terms: Vec<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
+    // Rerank-контур (Ф3): отдаём модели широкий кандидатный сет (top-50) +
+    // explore-семпл, ранжирование отдаётся самой модели (не вызываем LLM
+    // отдельно — дешевле и без отдельного ключа). Чистый BM25: `search`,
+    // без `search_best`/embedding (embedding из hot-path убран).
+    let limit = limit.min(50);
+    // terms склеиваем пробелом: нижний GraphIndex::search принимает строку и
+    // разбивает её на FTS-термы через OR. При and_mode делаем пост-фильтр.
+    let terms_owned = terms.to_vec();
+    let query = terms.join(" ");
+    let query_for_closure = query.clone();
+    let idx_clone = handle.clone();
+    // and-mode: просим больше кандидатов на OR-проходе, чтобы было из чего фильтровать.
+    let fetch_limit = if and_mode {
+        (limit * 4).min(200)
+    } else {
+        limit
+    };
+    let fetched = tokio::task::spawn_blocking(move || {
+        let idx = lock_index(&idx_clone)?;
+        let hits: Vec<Node> = idx.search(&query_for_closure, kind, fetch_limit)?;
+        let explore = idx.search_explore(2, 12)?;
+        Ok::<_, DeepseeknovaError>((hits, explore))
+    })
+    .await;
 
-#[async_trait]
-impl Tool for SearchCodeTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "search_code".to_string(),
-            description: "Searches the code graph for functions/structs/traits etc by symbol name or keywords. Returns matched entities with path and kind. Prefer over grep for semantic structure.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "terms": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Search terms."
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["or", "and"],
-                        "description": "or=any (default) / and=all."
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["file", "struct", "enum", "trait", "class", "function", "method"],
-                        "description": "Kind (optional)."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max (10 default, 50 cap)."
-                    }
-                },
-                "required": ["terms"]
-            }),
-        }
-    }
+    let (nodes, explore) = match fetched {
+        Ok(Ok((hits, explore))) => (hits, explore),
+        Ok(Err(e)) => return Ok(format!("code graph search error: {e}")),
+        Err(e) => return Ok(format!("graph search task failed: {e}")),
+    };
 
-    fn read_only(&self) -> bool {
-        true
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolContext,
-        args: &str,
-    ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
-        deepseeknova_security::context::enforce_capability(
-            ctx,
-            &self.schema().name,
-            deepseeknova_security::capability::Capability::FileRead,
-        )?;
-        let parsed: SearchCodeArgs = serde_json::from_str(args)?;
-        let handle = match graph_handle(ctx) {
-            Some(h) => h,
-            None => return Ok(NO_INDEX_MSG.to_string()),
-        };
-
-        let kind = parsed.kind.as_deref().and_then(NodeKind::parse);
-        // Rerank-контур (Ф3): отдаём модели широкий кандидатный сет (top-50) +
-        // explore-семпл, ранжирование отдаётся самой модели (не вызываем LLM
-        // отдельно — дешевле и без отдельного ключа). Чистый BM25: `search`,
-        // без `search_best`/embedding (embedding из hot-path убран).
-        let limit = parsed.limit.unwrap_or(10).min(50);
-        let and_mode = parsed.mode.as_deref() == Some("and");
-        // terms склеиваем пробелом: нижний GraphIndex::search принимает строку и
-        // разбивает её на FTS-термы через OR. При and_mode делаем пост-фильтр.
-        let terms = parsed.terms.clone();
-        let query = terms.join(" ");
-        let query_for_closure = query.clone();
-        let idx_clone = handle.clone();
-        // and-mode: просим больше кандидатов на OR-проходе, чтобы было из чего фильтровать.
-        let fetch_limit = if and_mode {
-            (limit * 4).min(200)
-        } else {
-            limit
-        };
-        let fetched = tokio::task::spawn_blocking(move || {
-            let idx = lock_index(&idx_clone)?;
-            let hits: Vec<Node> = idx.search(&query_for_closure, kind, fetch_limit)?;
-            let explore = idx.search_explore(2, 12)?;
-            Ok::<_, DeepseeknovaError>((hits, explore))
-        })
-        .await;
-
-        let (nodes, explore) = match fetched {
-            Ok(Ok((hits, explore))) => (hits, explore),
-            Ok(Err(e)) => return Ok(format!("code graph search error: {e}")),
-            Err(e) => return Ok(format!("graph search task failed: {e}")),
-        };
-
-        // and-режим: оставить только узлы, где ВСЕ термы встречаются в
-        // name/signature/doc (нижний слой умеет только OR).
-        let nodes: Vec<Node> = if and_mode {
-            nodes
-                .into_iter()
-                .filter(|n| {
-                    let hay = format!("{} {} {}", n.name, n.signature, n.doc).to_lowercase();
-                    parsed.terms.iter().all(|t| {
-                        let t = t.to_lowercase();
-                        t.is_empty() || hay.contains(&t)
-                    })
+    // and-режим: оставить только узлы, где ВСЕ термы встречаются в
+    // name/signature/doc (нижний слой умеет только OR).
+    let nodes: Vec<Node> = if and_mode {
+        nodes
+            .into_iter()
+            .filter(|n| {
+                let hay = format!("{} {} {}", n.name, n.signature, n.doc).to_lowercase();
+                terms_owned.iter().all(|t| {
+                    let t = t.to_lowercase();
+                    t.is_empty() || hay.contains(&t)
                 })
-                .take(limit)
-                .collect()
-        } else {
-            nodes
-        };
+            })
+            .take(limit)
+            .collect()
+    } else {
+        nodes
+    };
 
-        if nodes.is_empty() && explore.is_empty() {
-            return Ok(format!("no matches for '{}'", query));
-        }
-        let mut lines: Vec<String> = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, node)| {
-                format!(
-                    "{}. {} {} — {}:{}-{} · {}",
-                    i + 1,
+    if nodes.is_empty() && explore.is_empty() {
+        return Ok(format!("no matches for '{}'", query));
+    }
+    let mut lines: Vec<String> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            format!(
+                "{}. {} {} — {}:{}-{} · {}",
+                i + 1,
+                node.kind.as_str(),
+                node.name,
+                node.path,
+                node.start_line,
+                node.end_line,
+                node.signature
+            )
+        })
+        .collect();
+
+    // explore-кандидаты маркируются отдельной группой, чтобы модель
+    // понимала: это низкоранговый/непокрытый семпл, а не топ BM25.
+    if !explore.is_empty() {
+        let mut dedup: std::collections::HashSet<&str> =
+            nodes.iter().map(|n| n.path.as_str()).collect();
+        let mut shown = 0usize;
+        for node in &explore {
+            if dedup.insert(node.path.as_str()) {
+                shown += 1;
+                lines.push(format!(
+                    "e{}. {} {} — {}:{}-{} · {}  [explore]",
+                    shown,
                     node.kind.as_str(),
                     node.name,
                     node.path,
                     node.start_line,
                     node.end_line,
                     node.signature
-                )
-            })
-            .collect();
-
-        // explore-кандидаты маркируются отдельной группой, чтобы модель
-        // понимала: это низкоранговый/непокрытый семпл, а не топ BM25.
-        if !explore.is_empty() {
-            let mut dedup: std::collections::HashSet<&str> =
-                nodes.iter().map(|n| n.path.as_str()).collect();
-            let mut shown = 0usize;
-            for node in &explore {
-                if dedup.insert(node.path.as_str()) {
-                    shown += 1;
-                    lines.push(format!(
-                        "e{}. {} {} — {}:{}-{} · {}  [explore]",
-                        shown,
-                        node.kind.as_str(),
-                        node.name,
-                        node.path,
-                        node.start_line,
-                        node.end_line,
-                        node.signature
-                    ));
-                }
+                ));
             }
         }
-        Ok(lines.join("\n"))
     }
+    Ok(lines.join("\n"))
 }
 
 /// 沿调用方向（callers/callees/both）最多 3 跳遍历代码图邻居（`traverse_graph`）。
@@ -1031,13 +976,13 @@ impl Tool for TagCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "tag_code".to_string(),
-            description: "Distills semantic tags onto a code entity you confirmed relevant. Persisted so search_code finds it lexically next time.".to_string(),
+            description: "Distills semantic tags onto a code entity you confirmed relevant. Persisted so future symbol searches find it lexically.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "description": "Symbol name (as returned by search_code)."
+                        "description": "Symbol name (as returned by grep mode=symbols)."
                     },
                     "tags": {
                         "type": "array",
@@ -1075,7 +1020,7 @@ impl Tool for TagCodeTool {
             Ok(nodes) if !nodes.is_empty() => nodes[0].id.clone(),
             _ => {
                 return Ok(format!(
-                    "entity '{}' not found; tag nothing (use search_code first).",
+                    "entity '{}' not found; tag nothing (use grep mode=symbols first).",
                     parsed.entity
                 ))
             }
@@ -1100,7 +1045,66 @@ pub fn graph_query_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ExploreCodeTool),
         Arc::new(DepsCodeTool),
         Arc::new(TagCodeTool),
+        Arc::new(TagStatusTool),
     ]
+}
+
+/// 查询某文件的语义标签覆盖度（`tagged_count_for_file`）——供编辑后自动
+/// 触发器判断「是否需要补做 `tag_code`」。只读，无副作用。
+pub struct TagStatusTool;
+
+#[derive(Deserialize)]
+struct TagStatusArgs {
+    path: String,
+}
+
+#[async_trait]
+impl Tool for TagStatusTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "tag_status".to_string(),
+            description: "Reports how many symbols in a file already have semantic tags in the code graph. Use to decide whether distilling via tag_code is needed.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path, relative to the workspace root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        args: &str,
+    ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+        deepseeknova_security::context::enforce_capability(
+            ctx,
+            &self.schema().name,
+            deepseeknova_security::capability::Capability::FileRead,
+        )?;
+        let parsed: TagStatusArgs = serde_json::from_str(args)?;
+        let handle = match graph_handle(ctx) {
+            Some(h) => h,
+            None => return Ok(NO_INDEX_MSG.to_string()),
+        };
+        let idx = lock_index(&handle)?;
+        match idx.tagged_count_for_file(&parsed.path) {
+            Ok(n) => Ok(format!("tagged symbols in '{}': {}", parsed.path, n)),
+            Err(e) => Ok(format!(
+                "tag_status: could not read tag coverage for '{}': {}",
+                parsed.path, e
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1132,8 +1136,7 @@ mod tests {
         .unwrap();
         let ctx = ctx_with_index(root);
 
-        let s = SearchCodeTool
-            .execute(&ctx, r#"{"terms":["build_agent"]}"#)
+        let s = graph_search_terms(&ctx, &["build_agent".to_string()], None, false, 10)
             .await
             .unwrap();
         assert!(s.contains("build_agent"));
@@ -1184,8 +1187,7 @@ mod tests {
     async fn degrades_without_index() {
         let ctx = ToolContext::new("c2")
             .with_extension(deepseeknova_security::context::SecurityContext::with_safe_defaults());
-        let out = SearchCodeTool
-            .execute(&ctx, r#"{"terms":["x"]}"#)
+        let out = graph_search_terms(&ctx, &["x".to_string()], None, false, 10)
             .await
             .unwrap();
         assert!(out.contains("索引") || out.to_lowercase().contains("index"));
@@ -1455,10 +1457,15 @@ mod tests {
 
         // До дистилляции probe_hook попадает ТОЛЬКО как explore-кандидат (blind-gap),
         // а не как BM25-хит. Проверяем: нет строки "1. function probe_hook" (BM25 top).
-        let before = SearchCodeTool
-            .execute(&ctx, r#"{"terms":["tracing","instrumentation"]}"#)
-            .await
-            .unwrap();
+        let before = graph_search_terms(
+            &ctx,
+            &["tracing".to_string(), "instrumentation".to_string()],
+            None,
+            false,
+            10,
+        )
+        .await
+        .unwrap();
         let before_bm25 = before
             .lines()
             .any(|l| l.contains("probe_hook") && !l.contains("[explore]"));
@@ -1478,10 +1485,15 @@ mod tests {
         assert!(tagged.contains("tagged"), "{tagged}");
 
         // Теперь лексика находит узел как BM25-хит (без [explore]-метки).
-        let after = SearchCodeTool
-            .execute(&ctx, r#"{"terms":["tracing","instrumentation"]}"#)
-            .await
-            .unwrap();
+        let after = graph_search_terms(
+            &ctx,
+            &["tracing".to_string(), "instrumentation".to_string()],
+            None,
+            false,
+            10,
+        )
+        .await
+        .unwrap();
         let after_bm25 = after
             .lines()
             .any(|l| l.contains("probe_hook") && !l.contains("[explore]"));

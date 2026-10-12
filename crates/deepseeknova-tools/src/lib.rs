@@ -110,7 +110,6 @@ pub fn all_builtin_tools_with_sandbox_and_checkpoint(
         Arc::new(RememberTool),
         Arc::new(ForgetTool),
         Arc::new(RecallTool),
-        Arc::new(SearchCodeTool),
         Arc::new(TraverseGraphTool),
         Arc::new(RetrieveEntityTool),
         Arc::new(AskUserTool),

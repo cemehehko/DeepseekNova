@@ -58,24 +58,31 @@ pub use security::{build_permission_gate, build_security_context, permission_gat
 /// is enabled, steering the model toward graph tools over brute-force grep.
 /// English to stay consistent with the unified system-prompt family.
 const GRAPH_RETRIEVAL_HINT: &str = "\n\n## Code Retrieval Strategy\n\
-When locating code, prefer graph retrieval tools over blanket grep or \
-whole-file reads:\n\
-1. `search_code` to locate candidate symbols/entities by name or keyword(s);\n\
-2. `traverse_graph` to inspect callers/callees;\n\
-3. `retrieve_entity` (view=skeleton) to inspect structure, then view=full or \
-read_file once the target is confirmed;\n\
-4. `trace_code` to follow multi-hop call chains, including dynamic dispatch;\n\
-5. `impact_code` to estimate the blast radius of a refactor;\n\
-6. `explore_code` to read several entities' source grouped by file;\n\
-7. `deps_code` to inspect imports and external dependencies.\n\
 \n\
-When a bug lives in a known subsystem, give `search_code` the crate/subsystem\n\
-domain as terms (e.g. `[\"tui\", \"status\"]`) rather than a single broad word\n\
-like `model`, which floods results from unrelated crates.\n\
+`grep` is your single entry point for locating code. Its default `mode=all`\n\
+searches BOTH raw text (regex) and the semantic code graph (symbols) in one\n\
+call, returning a `[text]` section and a `[symbols]` section. Do not use a\n\
+separate graph-search tool before `grep` — the graph is already inside `grep`.\n\
 \n\
-Prefer a scoped `grep` (set `path` to the specific crate or module) or\n\
-`search_code` over `bash` grep across the repo root (`.`). Root-wide greps\n\
-are slow, noisy, and burn steps; constrain the search area before running one.";
+- Plain `grep` (no `mode`) already includes semantic symbol results; read the\n\
+  `[symbols]` section to find the defining node + exact path:line.\n\
+- Use `mode=symbols` (optionally with `terms`) when you only need structure.\n\
+- Use `mode=text` when you only need raw text/string literals.\n\
+- Then follow up with structure tools: `traverse_graph` (callers/callees),\n\
+  `retrieve_entity view=skeleton` then `view=full`, `trace_code` (multi-hop),\n\
+  `impact_code` (blast radius), `explore_code`/`deps_code` (grouped source/\n\
+  imports).\n\
+\n\
+Give `grep` focused terms for the crate/subsystem, not one broad word: e.g.\n\
+`pattern: \"status|ctx_usage\"` or `terms: [\"tui\", \"status\"]`.\n\
+\n\
+Do NOT fall back to `bash ... grep -rn ... .` across the repo root. Scope\n\
+`grep` with `path` (the specific crate or module) before scanning wide; root-\n\
+wide scans are slow, noisy, and burn steps.\n\
+\n\
+After you confirm a symbol is relevant, distill it with `tag_code` (entity\n\
+name + short semantic tags) so it stays findable in the code graph next time.\n\
+Tag only symbols you actually used to solve the task — never speculatively.";
 
 /// 设计 C：运行时「会话边界」序号。每次 `build_agent` 递增一次，用作
 /// skill `record_use` 的会话 id——每次构造 = 新会话，跨 build 的 recall
@@ -186,7 +193,6 @@ pub fn build_agent_with_role_providers(
     // disabled, exclude them from registration so the model never sees their
     // schemas (they'd otherwise degrade with a "graph unavailable" message).
     if !config.graph.enabled {
-        disabled.insert("search_code");
         disabled.insert("traverse_graph");
         disabled.insert("retrieve_entity");
     }
