@@ -87,6 +87,16 @@ const VOLATILE_ARG_KEYS: &[&str] = &[
     "seed",
 ];
 
+/// 从工具参数 JSON 里提取 `path`（`read_file`/`grep`/`ls` 等读工具都带）。
+/// 用于把「重读同一批文件」具象地写进 hint。取不到时返回空串。
+fn extract_path(args_json: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(args_json).ok()?;
+    match v.get("path") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// 递归规范化 JSON 值：排序对象键、丢弃易变键。返回值用于哈希。
 fn normalize_args(value: &Value) -> Value {
     match value {
@@ -147,6 +157,13 @@ pub struct LoopGuard {
     last_hint: Option<String>,
     /// `last_hint` 是否已被 run-loop 取走并注入（防重复注入同一 hint）。
     hint_delivered: bool,
+    /// 路径 → 读取次数（read 类工具），用于 hint 里点出「已重读的文件」。
+    read_path_counts: HashMap<String, u64>,
+    /// 本 run 内已触发告警的段数（进展重置后再度停滞 = 新段），用于升级
+    /// 文案（首次温和、再犯则强制重新规划）。
+    warn_episodes: u64,
+    /// 当前停滞段是否已计入 `warn_episodes`（防同一段内重复计数）。
+    episode_warned: bool,
     /// 解析后的进展工具集合（含内置默认 + 显式配置）。
     progress_tools: HashMap<String, ()>,
 }
@@ -169,6 +186,9 @@ impl LoopGuard {
             stagnant_warned: false,
             last_hint: None,
             hint_delivered: false,
+            read_path_counts: HashMap::new(),
+            warn_episodes: 0,
+            episode_warned: false,
             progress_tools,
         }
     }
@@ -191,6 +211,13 @@ impl LoopGuard {
 
         let sig = signature(tool_name, args_json);
         let is_progress = self.progress_tools.contains_key(tool_name);
+
+        // 读工具：记录 path 读取次数，供 hint 点出「重读的文件」。
+        if !is_progress && matches!(tool_name, "read_file" | "grep" | "glob") {
+            if let Some(p) = extract_path(args_json) {
+                *self.read_path_counts.entry(p).or_insert(0) += 1;
+            }
+        }
 
         let mut warning: Option<LoopGuardWarning> = None;
 
@@ -234,6 +261,7 @@ impl LoopGuard {
         if is_progress {
             self.steps_without_progress = 0;
             self.stagnant_warned = false;
+            self.episode_warned = false;
         } else {
             self.steps_without_progress += 1;
             let threshold = settings.max_steps_without_progress.max(1) as u64;
@@ -253,8 +281,41 @@ impl LoopGuard {
             }
         }
 
-        // 记录告警供 run-loop 反注入：新 hint 置未交付。
-        if let Some(w) = &warning {
+        // ── 告警后处理：附加重读文件清单 + 升级文案（再犯强制重规划）──
+        if let Some(w) = &mut warning {
+            // 同一停滞段只计一次段数（重复签名后续仍会警告，但不重复 +1）；
+            // 进展发生后 episode_warned 复位，再次停滞才 +1 → 区分首次 vs 再犯。
+            if !self.episode_warned {
+                self.episode_warned = true;
+                self.warn_episodes += 1;
+            }
+
+            // 1) 点出被反复读取的文件（取重读 ≥2 次的，至多 3 个）。
+            let mut hot: Vec<(&String, &u64)> = self
+                .read_path_counts
+                .iter()
+                .filter(|(_, c)| **c >= 2)
+                .collect();
+            hot.sort_by(|a, b| b.1.cmp(a.1));
+            if !hot.is_empty() {
+                let names: Vec<String> = hot
+                    .iter()
+                    .take(3)
+                    .map(|(p, c)| format!("{p} (×{c})"))
+                    .collect();
+                w.hint
+                    .push_str(&format!(" 重读文件: {}.", names.join(", ")));
+            }
+
+            // 2) 再犯（≥2 次告警段）→ 强制重规划文案。
+            if self.warn_episodes >= 2 {
+                w.hint.push_str(
+                    " [ESCALATION] 你已连续两次停滞 — 停止继续读，明确说出你打算改哪个\
+                     文件/函数；若尚未定位，请用 search_code 加更精确的 terms（含 crate/\
+                     子域，如 [\"tui\",\"status\"]）重新检索，而不是读无关文件。",
+                );
+            }
+
             self.last_hint = Some(w.hint.clone());
             self.hint_delivered = false;
         }
@@ -452,6 +513,52 @@ mod tests {
         assert!(
             second.is_none(),
             "повторный вызов не должен дублировать hint"
+        );
+    }
+
+    #[test]
+    fn hint_lists_repeatedly_read_files() {
+        let settings = LoopGuardSettings {
+            max_steps_without_progress: 3,
+            ..LoopGuardSettings::default()
+        };
+        let mut guard = LoopGuard::new(&settings);
+        // Один файл читается 3 раза (→ повторный warning + read_path_counts).
+        guard.observe(&settings, "read_file", r#"{"path":"src/router.rs"}"#);
+        guard.observe(&settings, "read_file", r#"{"path":"src/router.rs"}"#);
+        let w = guard
+            .observe(&settings, "read_file", r#"{"path":"src/router.rs"}"#)
+            .unwrap();
+        assert!(
+            w.hint.contains("重读文件") && w.hint.contains("src/router.rs"),
+            "hint должен назвать перечитываемый файл: {}",
+            w.hint
+        );
+    }
+
+    #[test]
+    fn escalation_fires_on_second_stagnation_episode() {
+        let settings = LoopGuardSettings {
+            max_steps_without_progress: 2,
+            ..LoopGuardSettings::default()
+        };
+        let mut guard = LoopGuard::new(&settings);
+
+        // Первый эпизод: 2 не-прогресс шага → первый warning (без ESCALATION).
+        guard.observe(&settings, "read_file", r#"{"path":"a"}"#);
+        let w1 = guard.observe(&settings, "grep", r#"{"path":"b"}"#).unwrap();
+        assert!(!w1.hint.contains("ESCALATION"));
+
+        // Прогресс — сброс.
+        guard.observe(&settings, "edit_file", r#"{"path":"x"}"#);
+
+        // Второй эпизод: снова 2 не-прогресс шага → warning с ESCALATION.
+        guard.observe(&settings, "read_file", r#"{"path":"c"}"#);
+        let w2 = guard.observe(&settings, "grep", r#"{"path":"d"}"#).unwrap();
+        assert!(
+            w2.hint.contains("ESCALATION"),
+            "второй эпизод должен эскалировать: {}",
+            w2.hint
         );
     }
 }

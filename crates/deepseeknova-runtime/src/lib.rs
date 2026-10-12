@@ -60,14 +60,18 @@ pub use security::{build_permission_gate, build_security_context, permission_gat
 const GRAPH_RETRIEVAL_HINT: &str = "\n\n## Code Retrieval Strategy\n\
 When locating code, prefer graph retrieval tools over blanket grep or \
 whole-file reads:\n\
-1. `search_code` to locate candidate symbols/entities by name or keyword;\n\
+1. `search_code` to locate candidate symbols/entities by name or keyword(s);\n\
 2. `traverse_graph` to inspect callers/callees;\n\
 3. `retrieve_entity` (view=skeleton) to inspect structure, then view=full or \
 read_file once the target is confirmed;\n\
 4. `trace_code` to follow multi-hop call chains, including dynamic dispatch;\n\
 5. `impact_code` to estimate the blast radius of a refactor;\n\
 6. `explore_code` to read several entities' source grouped by file;\n\
-7. `deps_code` to inspect imports and external dependencies.";
+7. `deps_code` to inspect imports and external dependencies.\n\
+\n\
+When a bug lives in a known subsystem, give `search_code` the crate/subsystem\n\
+domain as terms (e.g. `[\"tui\", \"status\"]`) rather than a single broad word\n\
+like `model`, which floods results from unrelated crates.";
 
 /// 设计 C：运行时「会话边界」序号。每次 `build_agent` 递增一次，用作
 /// skill `record_use` 的会话 id——每次构造 = 新会话，跨 build 的 recall
