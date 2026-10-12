@@ -2034,9 +2034,13 @@ async fn stream_and_process_turn(
                         );
                         let lsp_args = serde_json::json!({ "path": path }).to_string();
                         match lsp.execute(&lsp_ctx, &lsp_args).await {
+                            // 有效诊断或显式「无诊断」→ 注入；「语言服务器缺失/禁用」
+                            // 等可用性提示也一并注入一次，让模型知晓反馈通道未生效，
+                            // 而不是被静默吞掉（此前 `_ => {}` 会漏掉 `not found`）。
                             Ok(diag)
                                 if diag.starts_with("LSP diagnostics")
-                                    || diag.starts_with("No LSP diagnostics") =>
+                                    || diag.starts_with("No LSP diagnostics")
+                                    || diag.starts_with("lsp_diagnostics:") =>
                             {
                                 result.push_str("\n\n---\n");
                                 result.push_str(&diag);

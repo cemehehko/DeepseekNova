@@ -1139,6 +1139,67 @@ async fn post_edit_lsp_diagnostics_are_injected_into_tool_result() {
 }
 
 #[tokio::test]
+async fn post_edit_lsp_unavailability_notice_is_injected() {
+    // 语言服务器缺失时，`lsp_diagnostics` 返回 `lsp_diagnostics: language
+    // server ... not found`（可用性提示）。此前 `_ => {}` 会静默吞掉它，
+    // 模型误以为诊断已跑且干净。现在应注入，让模型知晓反馈通道未生效。
+    let write = Arc::new(SpyTool {
+        name: "write_file",
+        result: "wrote ok".into(),
+    });
+    let lsp = Arc::new(SpyTool {
+        name: "lsp_diagnostics",
+        result: "lsp_diagnostics: language server 'rust-analyzer' not found. \
+                 Install it to enable diagnostics."
+            .into(),
+    });
+    let responses = vec![
+        vec![
+            Chunk::ToolCallStart {
+                id: "call_1".into(),
+                name: "write_file".into(),
+            },
+            Chunk::ToolCallEnd {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            },
+            Chunk::Done,
+        ],
+        vec![
+            Chunk::TextDelta("done".into()),
+            Chunk::Usage(Usage::default()),
+            Chunk::Done,
+        ],
+    ];
+    let provider = Arc::new(MockProvider::sequential(responses));
+    let mut agent = Agent::new(provider, 5);
+    agent.register_tool(write);
+    agent.register_tool(lsp);
+
+    let mut stream = agent
+        .run_stream(RunInput {
+            prompt: "write a file".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    let mut injected = false;
+    while let Some(event) = stream.next().await {
+        if let Ok(RunEvent::ToolResult { result, .. }) = event {
+            if result.contains("rust-analyzer") && result.contains("not found") {
+                injected = true;
+            }
+        }
+    }
+    assert!(
+        injected,
+        "LSP unavailability notice must reach the model instead of being silently dropped"
+    );
+}
+
+#[tokio::test]
 async fn auto_router_decides_once_per_run_and_routes_all_steps() {
     let spy = Arc::new(SpyTool {
         name: "spy",
