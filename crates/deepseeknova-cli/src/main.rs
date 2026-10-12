@@ -1920,7 +1920,11 @@ fn ensure_first_run_configured(
             return Some(exit_code::CONFIG);
         }
     };
-    if pcfg.api_key.is_none() {
+    // GigaChat (Sber) authenticates via OAuth client_credentials (client_id +
+    // client_secret), not an API key — skip the API-key gate for it. Other
+    // OAuth-native dialects must extend this check when added.
+    let uses_oauth = pcfg.kind.as_str() == "gigachat";
+    if !uses_oauth && pcfg.api_key.is_none() {
         let env_name = pcfg.api_key_env.as_deref().unwrap_or("DEEPSEEK_API_KEY");
         if std::env::var_os(env_name).is_none() {
             eprintln!(
