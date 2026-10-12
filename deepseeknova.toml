@@ -1,0 +1,7 @@
+# deepseeknova project configuration
+
+[agent]
+max_steps = 50
+
+[permissions]
+default_mode = "allow"
