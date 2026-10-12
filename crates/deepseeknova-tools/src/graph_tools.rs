@@ -52,7 +52,9 @@ pub struct SearchCodeTool;
 
 #[derive(Deserialize)]
 struct SearchCodeArgs {
-    query: String,
+    terms: Vec<String>,
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -64,13 +66,19 @@ impl Tool for SearchCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "search_code".to_string(),
-            description: "Searches the code graph for functions, structs, traits, etc. by symbol name or keyword. Returns matched entities with path and kind. Use this instead of grep when you need semantic code structure.".to_string(),
+            description: "Searches the code graph for functions/structs/traits etc by symbol name or keywords. Returns matched entities with path and kind. Prefer over grep for semantic structure.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Search terms."
+                    },
+                    "mode": {
                         "type": "string",
-                        "description": "Symbol/keyword."
+                        "enum": ["or", "and"],
+                        "description": "or=any (default) / and=all."
                     },
                     "kind": {
                         "type": "string",
@@ -82,7 +90,7 @@ impl Tool for SearchCodeTool {
                         "description": "Max (10 default, 50 cap)."
                     }
                 },
-                "required": ["query"]
+                "required": ["terms"]
             }),
         }
     }
@@ -113,15 +121,22 @@ impl Tool for SearchCodeTool {
         // отдельно — дешевле и без отдельного ключа). Чистый BM25: `search`,
         // без `search_best`/embedding (embedding из hot-path убран).
         let limit = parsed.limit.unwrap_or(10).min(50);
-        let query = parsed.query.clone();
+        let and_mode = parsed.mode.as_deref() == Some("and");
+        // terms склеиваем пробелом: нижний GraphIndex::search принимает строку и
+        // разбивает её на FTS-термы через OR. При and_mode делаем пост-фильтр.
+        let terms = parsed.terms.clone();
+        let query = terms.join(" ");
+        let query_for_closure = query.clone();
         let idx_clone = handle.clone();
-        // 整个 lock+检索 经 spawn_blocking 移出 tokio worker（与 remember/recall 同款）。
+        // and-mode: просим больше кандидатов на OR-проходе, чтобы было из чего фильтровать.
+        let fetch_limit = if and_mode {
+            (limit * 4).min(200)
+        } else {
+            limit
+        };
         let fetched = tokio::task::spawn_blocking(move || {
             let idx = lock_index(&idx_clone)?;
-            let hits: Vec<Node> = idx.search(&query, kind, limit)?;
-            // Explore: непокрытые crate-ы (blind-gap) — всегда подмешиваем семпл,
-            // чтобы лексика не была единственным источником кандидатов. Обходимся
-            // без отдельного флага: семпл дешёв (LIMIT внутри SQL, top по PageRank).
+            let hits: Vec<Node> = idx.search(&query_for_closure, kind, fetch_limit)?;
             let explore = idx.search_explore(2, 12)?;
             Ok::<_, DeepseeknovaError>((hits, explore))
         })
@@ -133,8 +148,26 @@ impl Tool for SearchCodeTool {
             Err(e) => return Ok(format!("graph search task failed: {e}")),
         };
 
+        // and-режим: оставить только узлы, где ВСЕ термы встречаются в
+        // name/signature/doc (нижний слой умеет только OR).
+        let nodes: Vec<Node> = if and_mode {
+            nodes
+                .into_iter()
+                .filter(|n| {
+                    let hay = format!("{} {} {}", n.name, n.signature, n.doc).to_lowercase();
+                    parsed.terms.iter().all(|t| {
+                        let t = t.to_lowercase();
+                        t.is_empty() || hay.contains(&t)
+                    })
+                })
+                .take(limit)
+                .collect()
+        } else {
+            nodes
+        };
+
         if nodes.is_empty() && explore.is_empty() {
-            return Ok(format!("no matches for '{}'", parsed.query));
+            return Ok(format!("no matches for '{}'", query));
         }
         let mut lines: Vec<String> = nodes
             .iter()
@@ -990,7 +1023,7 @@ pub struct TagCodeTool;
 #[derive(Deserialize)]
 struct TagCodeArgs {
     entity: String,
-    tags: String,
+    tags: Vec<String>,
 }
 
 #[async_trait]
@@ -998,7 +1031,7 @@ impl Tool for TagCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "tag_code".to_string(),
-            description: "Distills semantic tags onto a code entity you confirmed relevant. Tags are space-separated keywords (e.g. \"trace span metric\"). Persisted to the code graph so subsequent search_code finds it lexically. Use after you verified the entity solves the query.".to_string(),
+            description: "Distills semantic tags onto a code entity you confirmed relevant. Persisted so search_code finds it lexically next time.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1007,8 +1040,9 @@ impl Tool for TagCodeTool {
                         "description": "Symbol name (as returned by search_code)."
                     },
                     "tags": {
-                        "type": "string",
-                        "description": "Space-separated semantic keywords describing what this entity does."
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Semantic keywords describing what this entity does (e.g. [\"trace\", \"span\", \"metric\"])."
                     }
                 },
                 "required": ["entity", "tags"]
@@ -1046,10 +1080,11 @@ impl Tool for TagCodeTool {
                 ))
             }
         };
-        match idx.tag_node(&id, &parsed.tags, "distill") {
+        let tags = parsed.tags.join(" ");
+        match idx.tag_node(&id, &tags, "distill") {
             Ok(()) => Ok(format!(
                 "tagged '{}' with '{}' (persisted to code graph).",
-                parsed.entity, parsed.tags
+                parsed.entity, tags
             )),
             Err(e) => Ok(format!("failed to tag: {e}")),
         }
@@ -1098,7 +1133,7 @@ mod tests {
         let ctx = ctx_with_index(root);
 
         let s = SearchCodeTool
-            .execute(&ctx, r#"{"query":"build_agent"}"#)
+            .execute(&ctx, r#"{"terms":["build_agent"]}"#)
             .await
             .unwrap();
         assert!(s.contains("build_agent"));
@@ -1150,7 +1185,7 @@ mod tests {
         let ctx = ToolContext::new("c2")
             .with_extension(deepseeknova_security::context::SecurityContext::with_safe_defaults());
         let out = SearchCodeTool
-            .execute(&ctx, r#"{"query":"x"}"#)
+            .execute(&ctx, r#"{"terms":["x"]}"#)
             .await
             .unwrap();
         assert!(out.contains("索引") || out.to_lowercase().contains("index"));
@@ -1421,7 +1456,7 @@ mod tests {
         // До дистилляции probe_hook попадает ТОЛЬКО как explore-кандидат (blind-gap),
         // а не как BM25-хит. Проверяем: нет строки "1. function probe_hook" (BM25 top).
         let before = SearchCodeTool
-            .execute(&ctx, r#"{"query":"tracing instrumentation"}"#)
+            .execute(&ctx, r#"{"terms":["tracing","instrumentation"]}"#)
             .await
             .unwrap();
         let before_bm25 = before
@@ -1432,11 +1467,11 @@ mod tests {
             "до дистилляции лексика не должна ранжировать probe_hook как BM25-хит: {before}"
         );
 
-        // Модель подтвердила узел → дистиллирует метку.
+        // Модель подтвердила узел → дистиллирует метку (массив тегов).
         let tagged = TagCodeTool
             .execute(
                 &ctx,
-                r#"{"entity":"probe_hook","tags":"tracing instrumentation"}"#,
+                r#"{"entity":"probe_hook","tags":["tracing","instrumentation"]}"#,
             )
             .await
             .unwrap();
@@ -1444,7 +1479,7 @@ mod tests {
 
         // Теперь лексика находит узел как BM25-хит (без [explore]-метки).
         let after = SearchCodeTool
-            .execute(&ctx, r#"{"query":"tracing instrumentation"}"#)
+            .execute(&ctx, r#"{"terms":["tracing","instrumentation"]}"#)
             .await
             .unwrap();
         let after_bm25 = after
