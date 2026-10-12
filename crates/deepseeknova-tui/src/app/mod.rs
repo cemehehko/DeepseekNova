@@ -26,12 +26,29 @@ use state::{AppState, KeyAction, PasteChip, PasteChipKind};
 
 /// ctx 计量的有效窗口：`min(context_window, budget_window)`——预算才是真实
 /// 压力点，窗口配置过大（如 1M）时进度条不至于永远接近 0%。预算缺省或为 0
-/// 时回退窗口本身。
+/// 时回退窗口本身；反之窗口未配置（provider/model 无 `context_window`）时
+/// 回退预算（其默认 128_000），保证状态行始终能显示「已用 / 窗口」。
 fn effective_ctx_window(context_window: Option<u32>, budget_window: Option<u32>) -> Option<u32> {
-    context_window.map(|w| match budget_window {
-        Some(b) if b > 0 => w.min(b),
-        _ => w,
-    })
+    match (context_window, budget_window) {
+        (Some(w), Some(b)) if b > 0 => Some(w.min(b)),
+        (Some(w), _) => Some(w),
+        (None, Some(b)) if b > 0 => Some(b),
+        (None, _) => None,
+    }
+}
+
+/// 状态行 ctx 占用 `(used_tokens, window_tokens)`：窗口已知即返回（无 usage
+/// 时 `used=0`），保证「已用 / 窗口」在收到首个 [`RunEvent::Usage`] 前也常驻
+/// 显示，而不是等到首条消息才出现。窗口不可知时返回 `None`（不显示）。
+fn ctx_usage(
+    usage: Option<&deepseeknova_core::chunk::Usage>,
+    window: Option<u32>,
+) -> Option<(u64, u64)> {
+    let window = window?;
+    let used = usage
+        .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
+        .unwrap_or(0);
+    Some((used, u64::from(window)))
 }
 
 /// 运行代际：每轮提交/取消递增，旧回合残留事件按 gen 丢弃。
@@ -175,15 +192,15 @@ pub async fn run_loop(
         {
             let report = r.ledger().report(&r.price_table());
             app.total_cost_usd = report.total_usd;
-            app.context_usage = app.usage.as_ref().and_then(|u| {
-                effective_ctx_window(caps.context_window, caps.budget_window).map(|window| {
-                    (
-                        u64::from(u.prompt_tokens) + u64::from(u.completion_tokens),
-                        u64::from(window),
-                    )
-                })
-            });
         }
+        // 上下文占用：只要窗口已知就常驻显示（首条消息前为 `0 / window`），
+        // 收到 RunEvent::Usage 后回填已用 token（prompt + completion）。之前
+        // 依赖 `app.usage` 非空才赋值，导致启动时/无 router 时连窗口大小都
+        // 不显示；且被 router 门控，未注入 router 的嵌入场景整段丢失。
+        app.context_usage = ctx_usage(
+            app.usage.as_ref(),
+            effective_ctx_window(caps.context_window, caps.budget_window),
+        );
         // 权限模式显示态：每帧从共享 gate 刷新（Ctrl+P 后立即反映）。
         if let Some(gate) = caps
             .runtime
@@ -846,8 +863,33 @@ mod tests {
         assert_eq!(effective_ctx_window(Some(128_000), None), Some(128_000));
         // 预算为 0（禁用语义）→ 窗口本身。
         assert_eq!(effective_ctx_window(Some(128_000), Some(0)), Some(128_000));
-        // 无窗口 → None（不显示占用率）。
-        assert_eq!(effective_ctx_window(None, Some(128_000)), None);
+        // 无窗口 → 回退预算窗口（provider 未配置 context_window 时仍显示占用率）。
+        assert_eq!(effective_ctx_window(None, Some(128_000)), Some(128_000));
+        // 窗口与预算皆无 → None（不显示占用率）。
+        assert_eq!(effective_ctx_window(None, None), None);
+    }
+
+    #[test]
+    fn ctx_usage_shows_window_even_before_first_usage() {
+        use deepseeknova_core::chunk::Usage;
+        // 无 usage 但窗口已知 → `0 / window`，启动即显示窗口大小。
+        assert_eq!(ctx_usage(None, Some(128_000)), Some((0, 128_000)));
+        // 有 usage → prompt + completion 之和为已用。
+        let usage = Usage {
+            prompt_tokens: 1_500,
+            completion_tokens: 300,
+            total_tokens: 1_800,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        assert_eq!(
+            ctx_usage(Some(&usage), Some(128_000)),
+            Some((1_800, 128_000))
+        );
+        // 窗口不可知 → None（不显示占用率）。
+        assert_eq!(ctx_usage(Some(&usage), None), None);
     }
 
     #[test]
