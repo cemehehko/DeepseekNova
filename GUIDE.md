@@ -128,7 +128,7 @@ Configuration is merged from multiple sources (last wins):
 
 [[providers]]                     # 注意：是 providers 列表，不是 [default_provider]
 name = "openai"                   # 唯一名，被 [[models]] 的 provider 字段引用
-kind = "openai"                   # openai | anthropic | ollama | deepseek-anthropic
+kind = "openai"                   # openai | anthropic | ollama | deepseek-anthropic | gigachat
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
@@ -1496,6 +1496,22 @@ kind = "openai"
 base_url = "https://api.githubcopilot.com"
 model = "gpt-4o"
 api_key_env = "GITHUB_TOKEN"
+```
+
+### GigaChat Provider (Сбер)
+
+```toml
+[[providers]]
+name = "giga"
+kind = "gigachat"
+base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+model = "GigaChat-Pro-preview"
+client_id = "…"     # обязательный — OAuth client_id
+client_secret = "…" # обязательный — OAuth client_secret
+# oauth_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+# scope = "GIGACHAT_API_PERS"
+# session_id = "…"  # фиксированный X-Session-ID для кеширования контекста
+# rq_uid = "…"      # заголовок RqUID (иначе генерируется UUID)
 ```
 
 ### Multiple Providers

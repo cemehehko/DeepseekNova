@@ -254,6 +254,32 @@ pub struct ProviderConfig {
     /// 一层有界 + TTL 的精确缓存。语义缓存不在本开关内（默认关闭）。
     #[serde(default)]
     pub cache_exact: Option<bool>,
+
+    /// GigaChat OAuth token endpoint URL（`kind = "gigachat"`）。
+    /// 默认 `https://ngw.devices.sberbank.ru:9443/api/v2/oauth`。
+    #[serde(default)]
+    pub oauth_url: Option<String>,
+
+    /// GigaChat OAuth `client_id`（`kind = "gigachat"`）。
+    #[serde(default)]
+    pub client_id: Option<String>,
+
+    /// GigaChat OAuth `client_secret`（`kind = "gigachat"`）。
+    #[serde(default)]
+    pub client_secret: Option<String>,
+
+    /// GigaChat OAuth `scope`（默认 `GIGACHAT_API_PERS`）。
+    #[serde(default)]
+    pub scope: Option<String>,
+
+    /// Фиксированный `X-Session-ID` для кеширования контекста GigaChat。
+    /// `None` = провайдер генерирует стабильный id в рамках инстанса.
+    #[serde(default)]
+    pub session_id: Option<String>,
+
+    /// GigaChat OAuth заголовок `RqUID`（необязательный; `None` = сгенерировать).
+    #[serde(default)]
+    pub rq_uid: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -2941,6 +2967,12 @@ mod tests {
                 cache_prompt_key: None,
                 cache_exact: None,
                 context_window: None,
+                oauth_url: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+                session_id: None,
+                rq_uid: None,
             }],
             ..Config::default()
         };

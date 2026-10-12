@@ -28,6 +28,9 @@ pub mod anthropic;
 pub mod auto;
 pub mod cost;
 pub mod embeddings;
+/// Sber GigaChat API provider: OAuth auth, native `functions` tool calling and
+/// `X-Session-ID` context caching.
+pub mod gigachat;
 /// OpenAI-compatible chat-completions provider with streaming, tool calling,
 /// and DeepSeek thinking-mode passthrough.
 pub mod openai;
@@ -378,6 +381,11 @@ pub mod factory {
             // Reasoning content is natively handled as thinking blocks — no manual
             // reasoning_content passthrough needed (unlike the OpenAI-compatible path).
             "deepseek-anthropic" => Box::new(build_deepseek_anthropic(cfg, temperature, effort)?),
+            // Sber GigaChat API. OAuth client-credentials auth, native
+            // `functions` tool calling and `X-Session-ID` context caching.
+            // reasoning_effort / thinking are DeepSeek-specific and are not
+            // translated into the GigaChat request body.
+            "gigachat" => Box::new(build_gigachat(cfg, temperature)?),
             "ollama" | "local" => {
                 let mut p = crate::openai::OpenAIProvider::new(
                     cfg.base_url
@@ -459,6 +467,45 @@ pub mod factory {
             p = p.with_temperature(temp);
         }
         p = p.with_cache_control(cfg.cache_control.unwrap_or(true));
+        Ok(p)
+    }
+
+    /// Sber GigaChat API provider. OAuth `client_id`/`client_secret` (from
+    /// config) drive the auth flow; reasoning-effort / thinking are not
+    /// translated (GigaChat has no such parameters). `X-Session-ID` comes from
+    /// `session_id` or is auto-generated per instance.
+    fn build_gigachat(
+        cfg: &ProviderConfig,
+        temperature: Option<f32>,
+    ) -> Result<crate::gigachat::GigaChatProvider, deepseeknova_core::DeepseeknovaError> {
+        let client_id = cfg.client_id.clone().ok_or_else(|| {
+            deepseeknova_core::DeepseeknovaError::config(
+                "gigachat provider requires client_id".to_string(),
+            )
+        })?;
+        let client_secret = cfg.client_secret.clone().ok_or_else(|| {
+            deepseeknova_core::DeepseeknovaError::config(
+                "gigachat provider requires client_secret".to_string(),
+            )
+        })?;
+
+        let mut p = crate::gigachat::GigaChatProvider::new(
+            cfg.base_url.as_deref(),
+            cfg.model.as_deref().unwrap_or("GigaChat"),
+            cfg.oauth_url.clone(),
+            client_id,
+            client_secret,
+            cfg.scope.clone(),
+            cfg.session_id.clone(),
+            cfg.rq_uid.clone(),
+            cfg.timeout_secs,
+            cfg.max_retries,
+            temperature,
+            None,
+        )?;
+        if let Some(temp) = temperature {
+            p = p.with_temperature(temp);
+        }
         Ok(p)
     }
 
@@ -585,6 +632,12 @@ pub mod factory {
                 cache_ttl: None,
                 cache_prompt_key: None,
                 cache_exact: None,
+                oauth_url: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+                session_id: None,
+                rq_uid: None,
             }
         }
 
@@ -662,6 +715,12 @@ pub mod factory {
                 cache_ttl: None,
                 cache_prompt_key: None,
                 cache_exact: None,
+                oauth_url: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+                session_id: None,
+                rq_uid: None,
             };
             let result = create_provider(&cfg);
             let err = match result {
@@ -704,6 +763,12 @@ pub mod factory {
                 cache_ttl: None,
                 cache_prompt_key: None,
                 cache_exact: None,
+                oauth_url: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+                session_id: None,
+                rq_uid: None,
             }
         }
 
@@ -782,6 +847,46 @@ mod factory_tests {
         let cfg = provider_cfg();
         // 构建成功即可 —— 模型名注入路径由 router 缓存键测试进一步覆盖
         let p = crate::factory::create_provider_with_model(&cfg, "my-model", None);
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn create_gigachat_provider_requires_oauth_credentials() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "giga"
+            kind = "gigachat"
+            base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+            model = "GigaChat-Pro-preview"
+        "#,
+        )
+        .unwrap();
+        // No client_id / client_secret → must fail with a clear config error.
+        let err = crate::factory::create_provider(&cfg);
+        let e = match err {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for gigachat without oauth credentials"),
+        };
+        assert!(
+            e.to_string().contains("client_id") || e.to_string().contains("client_secret"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn gigachat_kind_builds_provider() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "giga"
+            kind = "gigachat"
+            base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+            model = "GigaChat-Pro-preview"
+            client_id = "my-client"
+            client_secret = "my-secret"
+        "#,
+        )
+        .unwrap();
+        let p = crate::factory::create_provider(&cfg);
         assert!(p.is_ok(), "{:?}", p.err());
     }
 }

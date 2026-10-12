@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
 deepseeknova-core = { workspace = true }
 deepseeknova-config = { workspace = true }
 deepseeknova-context = { workspace = true }
