@@ -294,12 +294,134 @@ impl Tool for SkillTool {
 }
 
 // ---------------------------------------------------------------------------
+// SkillsTool — every skill behind one `skill(name)` tool
+// ---------------------------------------------------------------------------
+
+/// Exposes all resolved skills as a single `skill` tool whose `name`
+/// parameter is an enum of skill names, instead of one `skill__<name>` tool
+/// per skill. Keeps the tool list flat as skills are added.
+pub struct SkillsTool {
+    skills: Vec<SkillTool>,
+}
+
+impl SkillsTool {
+    /// Wrap the given skills; `None` when there are none to expose.
+    pub fn new(skills: Vec<Skill>) -> Option<Self> {
+        if skills.is_empty() {
+            return None;
+        }
+        Some(Self {
+            skills: skills.into_iter().map(SkillTool::new).collect(),
+        })
+    }
+
+    /// Names of the wrapped skills, in registration order.
+    pub fn skill_names(&self) -> Vec<&str> {
+        self.skills.iter().map(|s| s.skill.name.as_str()).collect()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SkillsArgs {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for SkillsTool {
+    fn schema(&self) -> ToolSchema {
+        let names = self.skill_names();
+        let list: String = self
+            .skills
+            .iter()
+            .map(|s| format!("\n- {}: {}", s.skill.name, s.skill.description))
+            .collect();
+        ToolSchema {
+            name: "skill".to_string(),
+            description: format!(
+                "Activates a skill and returns its instructions to follow. Skills:{list}"
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": names,
+                        "description": "Skill name."
+                    }
+                },
+                "required": ["name"]
+            }),
+            few_shot_examples: None,
+            return_parameters: None,
+        }
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        args: &str,
+    ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+        let parsed: SkillsArgs = serde_json::from_str(args)?;
+        match self.skills.iter().find(|s| s.skill.name == parsed.name) {
+            Some(skill) => skill.execute(ctx, "{}").await,
+            None => Ok(format!(
+                "unknown skill '{}'; available: {}",
+                parsed.name,
+                self.skill_names().join(", ")
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(name: &str, prompt: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: format!("{name} skill"),
+            model: None,
+            tools_allowed: vec![],
+            system_prompt: prompt.into(),
+            scope: SkillScope::Builtin,
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_tool_exposes_all_skills_behind_one_name() {
+        assert!(SkillsTool::new(vec![]).is_none());
+        let tool = SkillsTool::new(vec![
+            named("dna-spec", "Write a spec."),
+            named("first-principles", "Reason from basics."),
+        ])
+        .unwrap();
+        let schema = tool.schema();
+        assert_eq!(schema.name, "skill");
+        assert_eq!(
+            schema.parameters["properties"]["name"]["enum"],
+            serde_json::json!(["dna-spec", "first-principles"])
+        );
+        assert!(schema.description.contains("first-principles skill"));
+        assert!(tool.read_only());
+
+        let ctx = ToolContext::new("t");
+        let out = tool
+            .execute(&ctx, r#"{"name":"first-principles"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("Reason from basics."));
+        let unknown = tool.execute(&ctx, r#"{"name":"nope"}"#).await.unwrap();
+        assert!(unknown.contains("available: dna-spec, first-principles"));
+    }
 
     #[test]
     fn skill_tool_schema_name_is_prefixed() {

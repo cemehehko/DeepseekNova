@@ -1378,8 +1378,12 @@ async fn stream_and_process_turn(
     loop_guard: &mut crate::loop_guard::LoopGuard,
     loop_settings: &crate::loop_guard::LoopGuardSettings,
 ) -> Result<StepOutcome, DeepseeknovaError> {
-    // Build tool refs for provider
-    let tool_refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
+    // Build tool refs for provider; hidden tools stay callable via tool_map.
+    let tool_refs: Vec<&dyn Tool> = tools
+        .iter()
+        .filter(|t| t.advertised())
+        .map(|t| t.as_ref())
+        .collect();
 
     // DeepSeek V4 protocol — ValidatedRequest::new fails early with
     // structured violation list, preventing corrupt messages from

@@ -61,6 +61,8 @@ pub mod planner;
 pub mod prompt_dialect;
 /// 协议层：阶段门控 PhaseGate。
 pub mod protocol;
+/// `read_file` continuation points after a provider truncated its output.
+pub mod read_progress;
 /// 注册表中心：RegistryHub 统一管理 tools/providers/planners/skills/commands。
 pub mod registry;
 /// 运行器：Runner trait 及 RunEvent / RunInput。

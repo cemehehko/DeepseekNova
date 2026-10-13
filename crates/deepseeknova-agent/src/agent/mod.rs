@@ -969,6 +969,7 @@ impl Runner for Agent {
         let mut tools: Vec<deepseeknova_core::runner::RunnerToolInfo> = self
             .tools
             .values()
+            .filter(|t| t.advertised())
             .map(|t| {
                 // Record the dialect-localised schema (what the provider will
                 // actually serialise), not the raw English in-source schema.

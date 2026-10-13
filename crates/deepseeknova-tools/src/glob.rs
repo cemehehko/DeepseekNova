@@ -99,13 +99,24 @@ impl Tool for GlobTool {
         matches.sort();
 
         if matches.is_empty() {
-            Ok(format!("no files matched '{pattern_str}'"))
-        } else {
-            Ok(format!(
-                "{} matches for '{pattern_str}':\n{}",
-                matches.len(),
-                matches.join("\n")
-            ))
+            return Ok(format!("no files matched '{pattern_str}'"));
         }
+        let total = matches.len();
+        let listing = if total > GLOB_HEAD + GLOB_TAIL {
+            format!(
+                "{}\n... ({} more paths not shown; narrow with `path` or a more specific pattern)\n{}",
+                matches[..GLOB_HEAD].join("\n"),
+                total - GLOB_HEAD - GLOB_TAIL,
+                matches[total - GLOB_TAIL..].join("\n")
+            )
+        } else {
+            matches.join("\n")
+        };
+        Ok(format!("{total} matches for '{pattern_str}':\n{listing}"))
     }
 }
+
+/// Paths shown from the start and the end of a large match list; the middle
+/// is only counted, so a broad pattern cannot flood the context.
+const GLOB_HEAD: usize = 150;
+const GLOB_TAIL: usize = 50;

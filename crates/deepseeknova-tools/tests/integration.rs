@@ -260,6 +260,23 @@ async fn glob_matches_pattern() {
     assert!(result.contains("test.rs"));
 }
 
+#[tokio::test]
+async fn glob_caps_large_match_lists() {
+    let f = Fixture::new();
+    for i in 0..260 {
+        f.write(&format!("src/m{i:03}.rs"), "");
+    }
+    let ctx = test_ctx(f.path());
+    let result = GlobTool
+        .execute(&ctx, &path_extra_json(f.path(), r#""pattern":"**/*.rs""#))
+        .await
+        .unwrap();
+    assert!(result.starts_with("260 matches"), "{result}");
+    assert!(result.contains("m000.rs") && result.contains("m259.rs"));
+    assert!(!result.contains("m150.rs"), "middle must be omitted");
+    assert!(result.contains("60 more paths not shown"));
+}
+
 // ---------------------------------------------------------------------------
 // GrepTool
 // ---------------------------------------------------------------------------

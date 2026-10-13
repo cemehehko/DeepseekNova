@@ -170,6 +170,11 @@ concurrent_tools = true            # 同批读类工具并发、写类保序串�
 #                                   #   （默认关闭，opt-in：阈值语义需实测调优）
 
 [tools]                            # 按工具名覆盖（name/disabled/timeout_secs/max_file_size）
+# profile = "auto"                 # 向模型提供的内置工具集：auto | core | full。
+#                                   #   auto = 俄语方言 provider（GigaChat）用 core，其余 full；
+#                                   #   core = read_file/grep/bash/edit_file/write_file/ls/glob/
+#                                   #   retrieve_entity/skill/todo_write。集外工具仍注册
+#                                   #   但对模型隐藏（编辑后 LSP 诊断等内部调用照常），MCP 工具总是提供。
 [[tools.overrides]]
 name = "bash"
 timeout_secs = 120
@@ -314,8 +319,8 @@ reflect_max_chars = 4000             # 反思输入的最后完成文本上限�
 复用（标记 `[cached]`）；任何写工具执行后缓存整体失效。
 
 Coordinator 模式（`run --planner-model ...`）现在同样接入代码图索引：图检索工具
-（search_code / traverse_graph / retrieve_entity / trace_code / impact_code /
-explore_code）对执行器可用，只读工具对规划器开放；`[graph] enabled = false` 时自动排除。
+（grep mode=symbols / traverse_graph / retrieve_entity / trace_code /
+impact_code）对执行器可用，只读工具对规划器开放；`[graph] enabled = false` 时自动排除。
 
 ### 委派子代理（`[delegate]`）
 
@@ -658,7 +663,7 @@ memory stats / embed-backfill / cleanup   统计 / 嵌入回填 / 衰减清理�
 
 | Tool | Description | Read-only |
 |---|---|---|
-| `skill__<name>` | Activate a skill (one per registered skill) | Yes |
+| `skill` | Activate a skill by `name` (enum of registered skills); disable one via `[[tools.overrides]] name = "skill__<name>"` | Yes |
 
 ## Security Scan (CLI)
 
@@ -816,14 +821,13 @@ seeds（去停用词、去重、上限 8），让地图优先展示任务相关�
 
 ### 代码图多跳查询（A3.1）
 
-启用代码图后额外提供四个只读工具：
+启用代码图后额外提供三个只读工具：
 
 - `trace_code`：从任意符号出发沿 Calls/References/Dispatch 画多跳调用链
   （callers / callees / both，默认深度 6，超限输出标注 truncated）。
 - `impact_code`：反向追踪谁会到达该符号，按文件聚合受影响符号与路径，
   用于重构爆炸半径估算。
-- `explore_code`：一次传入多个符号，按文件分组输出带行号的源码片段
-  （或 skeleton 签名视图）。
+- 多个符号一次取回：`retrieve_entity` 的 `entities` 参数（亦接受文件路径与 `path:a-b`）。
 - `deps_code`：查询文件/符号的 import 依赖与依赖方（本地符号、文件间边、
   外部依赖标 `[external]`）；不带 entity 时输出全库外部依赖汇总。
 

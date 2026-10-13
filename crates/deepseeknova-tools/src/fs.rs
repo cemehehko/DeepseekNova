@@ -22,10 +22,19 @@ const MAX_READ_SIZE: u64 = 1024 * 1024; // 1 MB
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
+    /// Absent or `"auto"`: resume after a provider-truncated previous read of
+    /// this file, else from the start. `0`: from the start. `n`: from line n.
     #[serde(default)]
-    start_line: Option<usize>,
+    start_line: Option<StartLine>,
     #[serde(default)]
     end_line: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StartLine {
+    Line(usize),
+    Keyword(String),
 }
 
 #[async_trait]
@@ -43,8 +52,8 @@ impl Tool for ReadFileTool {
                     },
                     "start_line": {
                         "type": "integer",
-                        "minimum": 1,
-                        "description": "First line (1-based)."
+                        "minimum": 0,
+                        "description": "First line (1-based); omit: resume a truncated read; 0: from start."
                     },
                     "end_line": {
                         "type": "integer",
@@ -98,10 +107,33 @@ impl Tool for ReadFileTool {
 
         let content = fs::read_to_string(&path).await?;
 
+        let key = path.display().to_string();
+        let mut resumed: Option<usize> = None;
+        let start_line = match parsed.start_line {
+            Some(StartLine::Line(0)) => {
+                deepseeknova_core::read_progress::forget(&key);
+                None
+            }
+            Some(StartLine::Line(n)) => {
+                deepseeknova_core::read_progress::forget(&key);
+                Some(n)
+            }
+            Some(StartLine::Keyword(k)) if !k.eq_ignore_ascii_case("auto") => {
+                return Err(deepseeknova_core::DeepseeknovaError::tool(format!(
+                    "start_line must be a line number, 0 (from the start) or \"auto\", got {k:?}"
+                )));
+            }
+            Some(StartLine::Keyword(_)) | None => {
+                resumed = deepseeknova_core::read_progress::take_next_line(&key)
+                    .filter(|&n| n >= 1 && n <= content.lines().count());
+                resumed
+            }
+        };
+
         // Ranged read (1-based inclusive): only the body returned to the model is
         // sliced; the snippet is still registered on the WHOLE file content so
         // edit_file's snippet validation stays compatible.
-        let (display, range_note) = match (parsed.start_line, parsed.end_line) {
+        let (display, range_note) = match (start_line, parsed.end_line) {
             (None, None) => (content.clone(), String::new()),
             (s, e) => {
                 let lines: Vec<&str> = content.lines().collect();
@@ -132,11 +164,22 @@ impl Tool for ReadFileTool {
         let snippet_id = tracker.register(&path.to_string_lossy(), &content);
         drop(tracker);
 
+        // Kept after the body (not before it) so the `[Lines a-b of n]` header
+        // stays first for range-aware truncation.
+        let resume_note = resumed
+            .map(|n| {
+                format!(
+                    "\n[continued from line {n}: the previous read of this file was truncated; start_line=0 reads from the start]"
+                )
+            })
+            .unwrap_or_default();
+
         // Return content with snippet marker for edit validation
         Ok(format!(
-            "{}{}\n\n[SNIPPET ID: {}]\n[Snippet generated from: {}]\n",
+            "{}{}{}\n\n[SNIPPET ID: {}]\n[Snippet generated from: {}]\n",
             range_note,
             display.trim_end(),
+            resume_note,
             snippet_id,
             path.display()
         ))
@@ -212,6 +255,7 @@ impl Tool for WriteFileTool {
         )?;
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         let path = sanitize_path(&ctx.workspace_root, &parsed.path)?;
+        deepseeknova_core::read_progress::forget(&path.display().to_string());
         check_policy_path_allowed(ctx, &path)?;
 
         if ctx.cancellation.is_cancelled() {
@@ -364,6 +408,7 @@ impl Tool for EditFileTool {
         )?;
         let parsed: EditFileArgs = serde_json::from_str(args)?;
         let path = sanitize_path(&ctx.workspace_root, &parsed.path)?;
+        deepseeknova_core::read_progress::forget(&path.display().to_string());
         check_policy_path_allowed(ctx, &path)?;
 
         // snippet_id is now required — enforce read-then-edit contract
@@ -521,6 +566,8 @@ impl Tool for MoveFileTool {
         let parsed: MoveFileArgs = serde_json::from_str(args)?;
         let src = sanitize_path(&ctx.workspace_root, &parsed.source)?;
         let dst = sanitize_path(&ctx.workspace_root, &parsed.destination)?;
+        deepseeknova_core::read_progress::forget(&src.display().to_string());
+        deepseeknova_core::read_progress::forget(&dst.display().to_string());
         check_policy_path_allowed(ctx, &src)?;
         check_policy_path_allowed(ctx, &dst)?;
 
@@ -619,6 +666,7 @@ impl Tool for DeleteFileTool {
         )?;
         let parsed: DeleteFileArgs = serde_json::from_str(args)?;
         let path = sanitize_path(&ctx.workspace_root, &parsed.path)?;
+        deepseeknova_core::read_progress::forget(&path.display().to_string());
         check_policy_path_allowed(ctx, &path)?;
 
         if ctx.cancellation.is_cancelled() {
@@ -847,6 +895,66 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains('a') && out.contains('b') && out.contains('c'));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_auto_continues_after_provider_truncation() {
+        use deepseeknova_core::read_progress;
+        let dir = std::env::temp_dir().join(format!("dnv-read-auto-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let body: String = (1..=10).map(|i| format!("row {i}\n")).collect();
+        tokio::fs::write(dir.join("doc.md"), &body).await.unwrap();
+        let ctx = test_ctx(&dir);
+
+        let full = ReadFileTool
+            .execute(&ctx, r#"{"path":"doc.md"}"#)
+            .await
+            .unwrap();
+        let key = full
+            .split("[Snippet generated from: ")
+            .nth(1)
+            .and_then(|s| s.lines().next())
+            .and_then(|l| l.strip_suffix(']'))
+            .unwrap()
+            .to_string();
+
+        // A provider truncated the read after line 3 → auto resumes at 4.
+        read_progress::set_next_line(&key, 4);
+        let next = ReadFileTool
+            .execute(&ctx, r#"{"path":"doc.md"}"#)
+            .await
+            .unwrap();
+        assert!(next.starts_with("[Lines 4-10 of 10]\n4: row 4"), "{next}");
+        assert!(next.contains("continued from line 4"), "{next}");
+        // The point is consumed: the next plain read is the whole file again.
+        let again = ReadFileTool
+            .execute(&ctx, r#"{"path":"doc.md","start_line":"auto"}"#)
+            .await
+            .unwrap();
+        assert!(again.starts_with("row 1\n"), "{again}");
+
+        // start_line=0 reads from the start and drops the point.
+        read_progress::set_next_line(&key, 4);
+        let zero = ReadFileTool
+            .execute(&ctx, r#"{"path":"doc.md","start_line":0}"#)
+            .await
+            .unwrap();
+        assert!(zero.starts_with("row 1\n"), "{zero}");
+        assert_eq!(read_progress::take_next_line(&key), None);
+
+        // Writing the file invalidates the point.
+        read_progress::set_next_line(&key, 4);
+        WriteFileTool::new()
+            .execute(&ctx, r#"{"path":"doc.md","content":"new\n"}"#)
+            .await
+            .unwrap();
+        assert_eq!(read_progress::take_next_line(&key), None);
+
+        let bad = ReadFileTool
+            .execute(&ctx, r#"{"path":"doc.md","start_line":"next"}"#)
+            .await;
+        assert!(bad.is_err());
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

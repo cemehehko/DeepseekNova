@@ -296,17 +296,23 @@ pub struct RetrieveEntityTool;
 
 #[derive(Deserialize)]
 struct RetrieveEntityArgs {
-    entity: String,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    entities: Vec<String>,
     #[serde(default)]
     view: Option<String>,
 }
+
+/// Upper bound on entities per call, so a batch cannot flood the context.
+const MAX_ENTITIES_PER_CALL: usize = 10;
 
 #[async_trait]
 impl Tool for RetrieveEntityTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "retrieve_entity".to_string(),
-            description: "Retrieves a code entity from the code graph. view=skeleton gives doc comments + signatures (compact); view=full gives source lines with line numbers (token-capped; use read_file for complete source).".to_string(),
+            description: "Retrieves code entities (symbols, file paths, `path:a-b`). view=skeleton gives doc comments + signatures (compact); view=full gives source lines with line numbers (token-capped; use read_file for complete source).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -314,13 +320,17 @@ impl Tool for RetrieveEntityTool {
                         "type": "string",
                         "description": "Entity."
                     },
+                    "entities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Several at once."
+                    },
                     "view": {
                         "type": "string",
                         "enum": ["skeleton", "full"],
                         "description": "skeleton/full."
                     }
-                },
-                "required": ["entity"]
+                }
             }),
             few_shot_examples: None,
             return_parameters: None,
@@ -342,16 +352,107 @@ impl Tool for RetrieveEntityTool {
             deepseeknova_security::capability::Capability::FileRead,
         )?;
         let parsed: RetrieveEntityArgs = serde_json::from_str(args)?;
+        let full = parsed.view.as_deref() == Some("full");
+        let mut targets: Vec<String> = parsed.entity.into_iter().collect();
+        targets.extend(parsed.entities);
+        targets.dedup();
+        let targets: Vec<String> = targets
+            .iter()
+            .map(|t| normalize_entity(t).to_string())
+            .collect();
+        match targets.len() {
+            0 => Ok("retrieve_entity needs `entity` or `entities`.".to_string()),
+            1 => retrieve_one(ctx, &targets[0], full),
+            n => {
+                let mut out = Vec::new();
+                for t in targets.iter().take(MAX_ENTITIES_PER_CALL) {
+                    out.push(format!("## {t}\n{}", retrieve_one(ctx, t, full)?));
+                }
+                if n > MAX_ENTITIES_PER_CALL {
+                    out.push(format!(
+                        "... ({} more entities not retrieved; max {MAX_ENTITIES_PER_CALL} per call)",
+                        n - MAX_ENTITIES_PER_CALL
+                    ));
+                }
+                Ok(out.join("\n\n"))
+            }
+        }
+    }
+}
+
+/// Strip declaration keywords and signature tails that models copy from
+/// `grep mode=symbols` output (`fn foo(..)`, `pub struct Bar<T>`,
+/// `function foo`) down to the bare symbol name.
+fn normalize_entity(entity: &str) -> &str {
+    const PREFIXES: [&str; 12] = [
+        "pub(crate) ",
+        "pub ",
+        "async ",
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "type ",
+        "function ",
+        "method ",
+        "class ",
+    ];
+    let mut s = entity.trim();
+    while let Some(rest) = PREFIXES.iter().find_map(|p| s.strip_prefix(p)) {
+        s = rest.trim_start();
+    }
+    let end = s.find(['(', '<', ' ']).unwrap_or(s.len());
+    if end == 0 {
+        entity.trim()
+    } else {
+        &s[..end]
+    }
+}
+
+/// Retrieve a single entity: a symbol via the code graph, or a workspace file
+/// path (optionally `path:a-b`) directly.
+fn retrieve_one(
+    ctx: &ToolContext,
+    entity: &str,
+    full: bool,
+) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+    {
+        // Models pass file paths (often as listed by `grep mode=symbols` file
+        // nodes) or `path:a-b`; the graph resolves symbol names only.
+        if let Some((abs, rel, range)) = path_entity(ctx, entity) {
+            crate::fs::check_policy_path_allowed(ctx, &abs)?;
+            if range.is_some() || full {
+                let content = std::fs::read_to_string(&abs)?;
+                let total = content.lines().count().max(1) as u32;
+                let (start, end) = range.unwrap_or((1, total));
+                return Ok(render_source(&rel, &content, start, end.min(total)));
+            }
+            let skeleton = graph_handle(ctx).and_then(|h| {
+                let idx = h.lock().ok()?;
+                let id = idx.file_node(&rel).ok()??;
+                idx.skeleton(&id).ok()
+            });
+            return Ok(match skeleton {
+                Some(sk) if sk.lines().count() > 1 => format!(
+                    "{sk}\n(file skeleton; source: retrieve_entity view=full, \"{rel}:<a>-<b>\", or read_file)"
+                ),
+                _ => format!(
+                    "'{rel}' is a file with no indexed symbols; read it with read_file(path=\"{rel}\")."
+                ),
+            });
+        }
+
         let handle = match graph_handle(ctx) {
             Some(h) => h,
             None => return Ok(NO_INDEX_MSG.to_string()),
         };
         let idx = lock_index(&handle)?;
 
-        if parsed.view.as_deref() == Some("full") {
-            let (rel_path, start, end) = match idx.location(&parsed.entity) {
+        if full {
+            let (rel_path, start, end) = match idx.location(entity) {
                 Ok(loc) => loc,
-                Err(e) => return Ok(graph_error_message("locating the entity", &e)),
+                Err(e) => return Ok(entity_error(entity, "locating the entity", &e)),
             };
             let abs = deepseeknova_security::path::sanitize_path(&ctx.workspace_root, &rel_path)?;
             // T2：graph 读路径与 fs/grep/glob/ls 同口径执行 denied_paths 检查
@@ -365,40 +466,93 @@ impl Tool for RetrieveEntityTool {
                     ));
                 }
             };
-            let lines: Vec<String> = content
-                .lines()
-                .enumerate()
-                .filter(|(i, _)| {
-                    let lineno = (i + 1) as u32;
-                    lineno >= start && lineno <= end
-                })
-                .map(|(i, line)| format!("{:>5} | {}", i + 1, line))
-                .collect();
-            let full_text = format!("{rel_path}:{start}-{end}\n{}", lines.join("\n"));
-
-            // token 上限：避免超大函数源码全量注入 prompt 挤占上下文。
-            // 超限时头尾截断，提示用 read_file 按行范围读取完整源码。
-            const FULL_VIEW_TOKEN_CAP: usize = 4000;
-            let estimated = deepseeknova_core::tokens::estimate_text_tokens(&full_text) as usize;
-            if estimated <= FULL_VIEW_TOKEN_CAP {
-                return Ok(full_text);
-            }
-            let char_budget = deepseeknova_core::tokens::chars_for_tokens(FULL_VIEW_TOKEN_CAP);
-            let head: String = full_text.chars().take(char_budget / 2).collect();
-            let tail_chars: Vec<char> = full_text.chars().rev().take(char_budget / 2).collect();
-            let tail: String = tail_chars.into_iter().rev().collect();
-            let total_chars = full_text.chars().count();
-            let omitted = total_chars - head.chars().count() - tail.chars().count();
-            return Ok(format!(
-                "{head}\n\n... [{omitted} chars omitted, ~{estimated} tokens total; use read_file with line range {start}-{end} for full source] ...\n\n{tail}"
-            ));
+            return Ok(render_source(&rel_path, &content, start, end));
         }
 
-        match idx.skeleton(&parsed.entity) {
+        match idx.skeleton(entity) {
             Ok(sk) => Ok(sk),
-            Err(e) => Ok(graph_error_message("retrieving the skeleton", &e)),
+            Err(e) => Ok(entity_error(entity, "retrieving the skeleton", &e)),
         }
     }
+}
+
+/// A file target resolved from an entity string: `(absolute, relative, range)`.
+type PathEntity = (std::path::PathBuf, String, Option<(u32, u32)>);
+
+/// `entity` as an existing workspace file, optionally suffixed `:a-b` or `:a`;
+/// `None` for symbol names.
+fn path_entity(ctx: &ToolContext, entity: &str) -> Option<PathEntity> {
+    if entity.contains("::") || entity.contains('#') {
+        return None;
+    }
+    let (path, range) = match entity.rsplit_once(':') {
+        Some((p, r)) => {
+            let parsed = match r.split_once('-') {
+                Some((a, b)) => a.trim().parse().ok().zip(b.trim().parse().ok()),
+                None => r.trim().parse().ok().map(|a| (a, a)),
+            };
+            match parsed {
+                Some((a, b)) if a >= 1 && b >= a => (p, Some((a, b))),
+                _ => (entity, None),
+            }
+        }
+        None => (entity, None),
+    };
+    if !path.contains('/') && !path.contains('.') {
+        return None;
+    }
+    let abs = deepseeknova_security::path::sanitize_path(&ctx.workspace_root, path).ok()?;
+    if !abs.is_file() {
+        return None;
+    }
+    let rel = abs
+        .strip_prefix(&ctx.workspace_root)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.trim_start_matches("./").to_string());
+    Some((abs, rel, range))
+}
+
+/// Graph lookup error for `retrieve_entity`, telling the model the tool takes
+/// symbol names so it stops retrying the same file path.
+fn entity_error(entity: &str, action: &str, err: &GraphError) -> String {
+    match err {
+        GraphError::EntityNotFound(_) => format!(
+            "entity '{entity}' not found. retrieve_entity takes a symbol name (fn/struct/trait/method, e.g. `GraphIndex::open`) or a file path; find names with grep mode=symbols, read files with read_file."
+        ),
+        other => graph_error_message(action, other),
+    }
+}
+
+/// Line-numbered `start..=end` slice of `content`, token-capped: oversized
+/// slices keep head and tail and point to `read_file` for the full range.
+fn render_source(rel_path: &str, content: &str, start: u32, end: u32) -> String {
+    let lines: Vec<String> = content
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| {
+            let lineno = (i + 1) as u32;
+            lineno >= start && lineno <= end
+        })
+        .map(|(i, line)| format!("{:>5} | {}", i + 1, line))
+        .collect();
+    let full_text = format!("{rel_path}:{start}-{end}\n{}", lines.join("\n"));
+
+    // token 上限：避免超大函数源码全量注入 prompt 挤占上下文。
+    // 超限时头尾截断，提示用 read_file 按行范围读取完整源码。
+    const FULL_VIEW_TOKEN_CAP: usize = 4000;
+    let estimated = deepseeknova_core::tokens::estimate_text_tokens(&full_text) as usize;
+    if estimated <= FULL_VIEW_TOKEN_CAP {
+        return full_text;
+    }
+    let char_budget = deepseeknova_core::tokens::chars_for_tokens(FULL_VIEW_TOKEN_CAP);
+    let head: String = full_text.chars().take(char_budget / 2).collect();
+    let tail_chars: Vec<char> = full_text.chars().rev().take(char_budget / 2).collect();
+    let tail: String = tail_chars.into_iter().rev().collect();
+    let total_chars = full_text.chars().count();
+    let omitted = total_chars - head.chars().count() - tail.chars().count();
+    format!(
+        "{head}\n\n... [{omitted} chars omitted, ~{estimated} tokens total; use read_file with start_line={start}, end_line={end} for full source] ...\n\n{tail}"
+    )
 }
 
 /// 渲染一条路径：`name @ path:line → name @ path:line → …`。
@@ -645,165 +799,6 @@ impl Tool for ImpactCodeTool {
         }
         Ok(out)
     }
-}
-
-/// 把多个实体渲染为按文件分组的带行号源码（`explore_code`）。
-pub struct ExploreCodeTool;
-
-#[derive(Deserialize)]
-struct ExploreCodeArgs {
-    entities: Vec<String>,
-    #[serde(default)]
-    view: Option<String>,
-}
-
-#[async_trait]
-impl Tool for ExploreCodeTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "explore_code".to_string(),
-            description: "Reads entities as line-numbered source grouped by file.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "entities": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Entities to explore (grouped by file)."
-                    },
-                    "view": {
-                        "type": "string",
-                        "enum": ["full", "skeleton"],
-                        "description": "full=source lines (default); skeleton=doc+signatures."
-                    }
-                },
-                "required": ["entities"]
-            }),
-            few_shot_examples: None,
-            return_parameters: None,
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolContext,
-        args: &str,
-    ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
-        deepseeknova_security::context::enforce_capability(
-            ctx,
-            &self.schema().name,
-            deepseeknova_security::capability::Capability::FileRead,
-        )?;
-        let parsed: ExploreCodeArgs = serde_json::from_str(args)?;
-        let handle = match graph_handle(ctx) {
-            Some(h) => h,
-            None => return Ok(NO_INDEX_MSG.to_string()),
-        };
-        let idx = lock_index(&handle)?;
-
-        let view = parsed.view.as_deref().unwrap_or("full");
-        let mut located: Vec<(String, String, u32, u32)> = Vec::new(); // name, path, start, end
-        let mut missing: Vec<String> = Vec::new();
-        for entity in &parsed.entities {
-            match idx.location(entity) {
-                Ok((path, start, end)) => located.push((entity.clone(), path, start, end)),
-                Err(e) => missing.push(format!(
-                    "{} ({})",
-                    entity,
-                    graph_error_message("locating the entity", &e)
-                )),
-            }
-        }
-        if located.is_empty() {
-            return Ok(missing
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "no entities provided".to_string()));
-        }
-
-        let mut out = String::new();
-        if view == "skeleton" {
-            let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (name, path, _, _) in &located {
-                match idx.skeleton(name) {
-                    Ok(sk) => grouped
-                        .entry(path.clone())
-                        .or_default()
-                        .push(format!("{name}:\n{}", indent(&sk, 2))),
-                    Err(e) => missing.push(format!(
-                        "{} ({})",
-                        name,
-                        graph_error_message("retrieving the skeleton", &e)
-                    )),
-                }
-            }
-            for (path, entries) in &grouped {
-                out.push_str(&format!("## {path}\n"));
-                for entry in entries {
-                    out.push_str(entry);
-                }
-            }
-        } else {
-            let mut grouped: BTreeMap<String, Vec<(String, u32, u32)>> = BTreeMap::new();
-            for (name, path, start, end) in located {
-                grouped.entry(path).or_default().push((name, start, end));
-            }
-            for (path, mut ranges) in grouped {
-                ranges.sort_by_key(|r| (r.1, r.2));
-                // 合并相邻/重叠区间，按文件一次读取。
-                let mut merged: Vec<(u32, u32)> = Vec::new();
-                for (_, start, end) in ranges {
-                    if let Some(last) = merged.last_mut() {
-                        if start <= last.1.saturating_add(1) {
-                            last.1 = last.1.max(end);
-                            continue;
-                        }
-                    }
-                    merged.push((start, end));
-                }
-                let abs = deepseeknova_security::path::sanitize_path(&ctx.workspace_root, &path)?;
-                // T2：graph 检索读路径同口径执行 denied_paths 检查。
-                crate::fs::check_policy_path_allowed(ctx, &abs)?;
-                let content = match std::fs::read_to_string(&abs) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Ok(format!("failed to read {path}: {e}; index may be stale"));
-                    }
-                };
-                out.push_str(&format!("## {path}\n"));
-                for (start, end) in merged {
-                    for (i, line) in content.lines().enumerate() {
-                        let lineno = (i + 1) as u32;
-                        if lineno >= start && lineno <= end {
-                            out.push_str(&format!("{:>5} | {line}\n", lineno));
-                        }
-                    }
-                }
-            }
-        }
-        if !missing.is_empty() {
-            out.push_str(&format!("(not found: {})\n", missing.join("; ")));
-        }
-        if out.len() > 8000 {
-            let end = out.floor_char_boundary(8000);
-            out.truncate(end);
-        }
-        Ok(out)
-    }
-}
-
-fn indent(text: &str, spaces: usize) -> String {
-    let pad = " ".repeat(spaces);
-    text.lines()
-        .map(|l| format!("{pad}{l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// 检视某文件的 import 与外部依赖；不传实体时给出工作区外部依赖汇总（`deps_code`）。
@@ -1056,10 +1051,10 @@ pub fn graph_query_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(TraceCodeTool),
         Arc::new(ImpactCodeTool),
-        Arc::new(ExploreCodeTool),
         Arc::new(DepsCodeTool),
         Arc::new(TagCodeTool),
-        Arc::new(TagStatusTool),
+        // Internal only: the post-edit distill hint calls it by name.
+        Arc::new(deepseeknova_core::HiddenTool(Arc::new(TagStatusTool))),
     ]
 }
 
@@ -1199,6 +1194,65 @@ mod tests {
         assert!(sk.unwrap().contains("not found"));
     }
 
+    #[test]
+    fn normalize_entity_strips_declaration_keywords() {
+        assert_eq!(
+            normalize_entity("fn recovery_tool_map"),
+            "recovery_tool_map"
+        );
+        assert_eq!(normalize_entity("pub async fn run(&self)"), "run");
+        assert_eq!(normalize_entity("pub struct Bar<T>"), "Bar");
+        assert_eq!(normalize_entity("impl Provider for X"), "Provider");
+        assert_eq!(normalize_entity("function only"), "only");
+        assert_eq!(normalize_entity("GraphIndex::open"), "GraphIndex::open");
+        assert_eq!(normalize_entity("src/a.rs:2-3"), "src/a.rs:2-3");
+    }
+
+    #[tokio::test]
+    async fn retrieve_entity_accepts_file_paths_and_ranges() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/model.rs"),
+            "/// Kind.\npub enum Kind { A }\n\npub fn helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.md"), "# Notes\nplain text\n").unwrap();
+        let ctx = ctx_with_index(root);
+
+        let sk = RetrieveEntityTool
+            .execute(&ctx, r#"{"entity":"src/model.rs"}"#)
+            .await
+            .unwrap();
+        assert!(sk.contains("pub fn helper"), "file skeleton: {sk}");
+
+        let full = RetrieveEntityTool
+            .execute(&ctx, r#"{"entity":"src/model.rs","view":"full"}"#)
+            .await
+            .unwrap();
+        assert!(full.contains("4 | pub fn helper() {}"), "{full}");
+
+        let range = RetrieveEntityTool
+            .execute(&ctx, r#"{"entity":"src/model.rs:2-2"}"#)
+            .await
+            .unwrap();
+        assert!(range.contains("2 | pub enum Kind"), "{range}");
+        assert!(!range.contains("helper"), "{range}");
+
+        let md = RetrieveEntityTool
+            .execute(&ctx, r#"{"entity":"notes.md"}"#)
+            .await
+            .unwrap();
+        assert!(md.contains("read_file(path=\"notes.md\")"), "{md}");
+
+        let missing = RetrieveEntityTool
+            .execute(&ctx, r#"{"entity":"src/nope.rs"}"#)
+            .await
+            .unwrap();
+        assert!(missing.contains("takes a symbol name"), "{missing}");
+    }
+
     #[tokio::test]
     async fn degrades_without_index() {
         let ctx = ToolContext::new("c2")
@@ -1304,7 +1358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explore_code_groups_entities_by_file() {
+    async fn retrieve_entity_returns_several_entities() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1312,12 +1366,15 @@ mod tests {
         std::fs::write(root.join("src/b.rs"), "pub fn g() {}\n").unwrap();
         let ctx = ctx_with_index(root);
 
-        let out = ExploreCodeTool
-            .execute(&ctx, r#"{"entities":["f1","g","f2"]}"#)
+        let out = RetrieveEntityTool
+            .execute(
+                &ctx,
+                r#"{"entities":["f1","g","src/a.rs:2-2"],"view":"full"}"#,
+            )
             .await
             .unwrap();
-        assert!(out.contains("## src/a.rs"), "{out}");
-        assert!(out.contains("## src/b.rs"), "{out}");
+        assert!(out.contains("## f1"), "{out}");
+        assert!(out.contains("## src/a.rs:2-2"), "{out}");
         assert!(out.contains("1 | pub fn f1() {}"), "{out}");
         assert!(out.contains("2 | pub fn f2() {}"), "{out}");
         assert!(out.contains("1 | pub fn g() {}"), "{out}");
@@ -1341,10 +1398,10 @@ mod tests {
         assert!(i.is_ok(), "impact must not bubble error");
         assert!(i.unwrap().contains("not found"));
 
-        let e = ExploreCodeTool
-            .execute(&ctx, r#"{"entities":["no_such"]}"#)
+        let e = RetrieveEntityTool
+            .execute(&ctx, r#"{"entities":["no_such","only"]}"#)
             .await;
-        assert!(e.is_ok(), "explore must not bubble error");
+        assert!(e.is_ok(), "batch retrieve must not bubble error");
         assert!(e.unwrap().contains("not found"));
     }
 

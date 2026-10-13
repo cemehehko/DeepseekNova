@@ -126,6 +126,8 @@ impl Memory {
 
         self.messages.clear();
         self.shrunk_messages.clear();
+        // The model no longer holds the parts it was continuing from.
+        deepseeknova_core::read_progress::clear();
 
         // Prepend the digest as a tool message the model can read.
         self.messages.push_back(Message {
@@ -209,6 +211,9 @@ impl Memory {
                 );
 
                 self.shrunk_messages.insert(call_id.clone());
+                // Context shrink: continuation points may refer to text the
+                // model no longer sees.
+                deepseeknova_core::read_progress::clear();
             }
         }
     }
@@ -381,6 +386,15 @@ mod tests {
         m.add_message(msg(Role::User, "first"));
         m.add_message(msg(Role::Assistant, "second"));
         m
+    }
+
+    #[test]
+    fn compaction_clears_read_continuation_points() {
+        let path = "/tmp/dnv-memory-compact-read-progress.md";
+        deepseeknova_core::read_progress::set_next_line(path, 12);
+        let mut m = seed_memory();
+        m.compact("digest".into(), None);
+        assert_eq!(deepseeknova_core::read_progress::take_next_line(path), None);
     }
 
     #[test]

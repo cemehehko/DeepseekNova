@@ -246,9 +246,8 @@ async fn run_text_scan(
     let mut state = ScanState::new();
 
     if base.is_file() {
-        let bytes = search_file(&base, &re, &mut state.results, limits.max_file_size)?;
-        state.total_bytes_searched += bytes;
-        state.files_searched = 1;
+        let scanned = search_file(&base, &re, &mut state.results, limits.max_file_size)?;
+        state.record(scanned);
     } else {
         walk_dir(
             &base,
@@ -262,24 +261,60 @@ async fn run_text_scan(
         .await?;
     }
 
+    let mut stop_note = String::new();
+    if state.skipped > 0 {
+        stop_note.push_str(&format!(
+            "\n(skipped {} binary or oversized file(s))",
+            state.skipped
+        ));
+    }
+    if let Some(s) = state.stop.as_deref() {
+        stop_note.push_str(&format!("\n{s}"));
+    }
     if state.results.is_empty() {
-        Ok(format!(
-            "no matches for '{}' in {} (searched {} files, {} bytes)",
+        return Ok(format!(
+            "no matches for '{}' in {} (searched {} files, {} bytes){stop_note}",
             parsed.pattern,
             base.display(),
             state.files_searched,
             state.total_bytes_searched
-        ))
-    } else {
-        Ok(format!(
-            "{} match(es) in {} files ({} bytes):\n{}",
-            state.results.len(),
-            state.files_searched,
-            state.total_bytes_searched,
-            state.results.join("\n")
-        ))
+        ));
     }
+    let total = state.results.len();
+    let shown = total.min(MAX_MATCHES_SHOWN);
+    let header = if shown < total {
+        format!(
+            "{total} match(es) in {} files ({} bytes), showing first {shown}:",
+            state.files_searched, state.total_bytes_searched
+        )
+    } else {
+        format!(
+            "{total} match(es) in {} files ({} bytes):",
+            state.files_searched, state.total_bytes_searched
+        )
+    };
+    let more = if shown < total {
+        format!(
+            "\n... ({} more matches not shown; narrow with `path`, `glob` or a more specific pattern)",
+            total - shown
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{header}\n{}{more}{stop_note}",
+        state.results[..shown].join("\n")
+    ))
 }
+
+/// Directory names never descended into during a workspace scan (build
+/// output, VCS internals, dependency trees, agent state such as traces).
+/// An explicit `path` pointing inside one of them is still searched.
+const SKIP_DIRS: [&str; 5] = ["target", "node_modules", ".git", "dist", ".deepseeknova"];
+
+/// Matches returned to the model; the rest are only counted, so a broad
+/// pattern cannot flood the context.
+const MAX_MATCHES_SHOWN: usize = 100;
 
 /// grep 扫描的限额集合（来自 SecurityContext；缺省时回落内置默认值）。
 #[derive(Clone, Copy)]
@@ -294,6 +329,10 @@ struct ScanState {
     results: Vec<String>,
     files_searched: u32,
     total_bytes_searched: u64,
+    /// Why the scan stopped early, if it did; reported once, not as a match.
+    stop: Option<String>,
+    /// Binary or oversized files skipped; reported as one count, not as matches.
+    skipped: u32,
 }
 
 impl ScanState {
@@ -302,6 +341,16 @@ impl ScanState {
             results: Vec::new(),
             files_searched: 0,
             total_bytes_searched: 0,
+            stop: None,
+            skipped: 0,
+        }
+    }
+
+    fn record(&mut self, scanned: Option<u64>) {
+        self.files_searched += 1;
+        match scanned {
+            Some(bytes) => self.total_bytes_searched += bytes,
+            None => self.skipped += 1,
         }
     }
 }
@@ -319,15 +368,19 @@ async fn walk_dir(
 ) -> Result<(), DeepseeknovaError> {
     let mut read_dir = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = read_dir.next_entry().await? {
+        if state.stop.is_some() {
+            return Ok(());
+        }
         if state.files_searched >= limits.max_files {
-            state
-                .results
-                .push(format!("... (stopped after {} files)", limits.max_files));
+            state.stop = Some(format!(
+                "... (stopped after {} files; results are incomplete — narrow with `path`)",
+                limits.max_files
+            ));
             return Ok(());
         }
         if state.total_bytes_searched >= limits.max_total_bytes {
-            state.results.push(format!(
-                "... (stopped after reading {} bytes)",
+            state.stop = Some(format!(
+                "... (stopped after reading {} bytes; results are incomplete — narrow with `path`)",
                 limits.max_total_bytes
             ));
             return Ok(());
@@ -341,6 +394,13 @@ async fn walk_dir(
             continue;
         }
         if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SKIP_DIRS.contains(&n))
+            {
+                continue;
+            }
             // 递归 async fn 必须装箱（Box::pin），避免无限大小的 future 类型。
             let recurse = walk_dir(&path, root, re, parsed, ctx, state, limits);
             Box::pin(recurse).await?;
@@ -352,26 +412,25 @@ async fn walk_dir(
                     continue;
                 }
             }
-            let bytes = search_file(&path, re, &mut state.results, limits.max_file_size)?;
-            state.total_bytes_searched += bytes;
-            state.files_searched += 1;
+            let scanned = search_file(&path, re, &mut state.results, limits.max_file_size)?;
+            state.record(scanned);
         }
     }
     Ok(())
 }
 
-/// Search a single file for regex matches. Returns size of read file.
+/// Search a single file for regex matches. Returns the bytes read, or `None`
+/// when the file was skipped as oversized or binary (non-UTF-8).
 fn search_file(
     path: &std::path::Path,
     re: &regex::Regex,
     results: &mut Vec<String>,
     max_file_size: u64,
-) -> Result<u64, DeepseeknovaError> {
+) -> Result<Option<u64>, DeepseeknovaError> {
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len();
     if size > max_file_size {
-        results.push(format!("{}: [file too large, skipped]", path.display()));
-        return Ok(0);
+        return Ok(None);
     }
 
     // Бинарные/не-UTF8 файлы (`.deepseeknova/graph.db`, `target/` артефакты и
@@ -379,7 +438,7 @@ fn search_file(
     // весь workspace целиком, включая служебные файлы.
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return Ok(0),
+        Err(_) => return Ok(None),
     };
     for (line_num, line) in content.lines().enumerate() {
         if re.is_match(line) {
@@ -392,7 +451,7 @@ fn search_file(
             results.push(format!("{}:{}: {}", path.display(), line_num + 1, trimmed));
         }
     }
-    Ok(size)
+    Ok(Some(size))
 }
 
 /// Simple glob match for file name filtering (supports * and ? wildcards).
@@ -512,6 +571,119 @@ mod tests {
             out.contains("stopped after reading 10 bytes"),
             "byte aggregate must stop the scan: {out}"
         );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn grep_skips_build_and_vcs_dirs() {
+        let dir = std::env::temp_dir().join(format!("dnv-grep-skip-{}", std::process::id()));
+        for d in ["src", "target/debug", ".git/objects", ".deepseeknova/trace"] {
+            tokio::fs::create_dir_all(dir.join(d)).await.unwrap();
+        }
+        for f in [
+            "src/a.rs",
+            "target/debug/x.rs",
+            ".git/objects/y",
+            ".deepseeknova/trace/t.jsonl",
+        ] {
+            tokio::fs::write(dir.join(f), "needle\n").await.unwrap();
+        }
+        let ctx = temp_ctx(&dir);
+        let out = GrepTool
+            .execute(&ctx, r#"{"pattern":"needle","mode":"text"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("1 match(es)"), "only src counts: {out}");
+        assert!(out.contains("a.rs:1: needle"), "{out}");
+
+        // An explicit path inside a skipped dir is still searched.
+        let inside = GrepTool
+            .execute(
+                &ctx,
+                r#"{"pattern":"needle","path":"target","mode":"text"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(inside.contains("x.rs:1: needle"), "{inside}");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn grep_stop_marker_reported_once_and_not_counted() {
+        let dir = std::env::temp_dir().join(format!("dnv-grep-stop-{}", std::process::id()));
+        for d in ["a/b/c", "d/e"] {
+            tokio::fs::create_dir_all(dir.join(d)).await.unwrap();
+        }
+        for f in [
+            "a/1.txt",
+            "a/b/2.txt",
+            "a/b/c/3.txt",
+            "d/4.txt",
+            "d/e/5.txt",
+        ] {
+            tokio::fs::write(dir.join(f), "nothing\n").await.unwrap();
+        }
+        let mut sec = SecurityContext::with_safe_defaults();
+        sec.limits.max_files = 1;
+        let ctx = ToolContext::new("grep-test")
+            .with_workspace(dir.clone())
+            .with_extension(sec);
+        let out = GrepTool
+            .execute(&ctx, r#"{"pattern":"needle","mode":"text"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("no matches"), "marker is not a match: {out}");
+        assert_eq!(out.matches("stopped after 1 files").count(), 1, "{out}");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn grep_counts_binary_and_oversized_files_instead_of_listing_them() {
+        let dir = std::env::temp_dir().join(format!("dnv-grep-bin-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("img.png"), [0x89u8, 0x50, 0xff, 0xfe, 0x00])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("big.txt"), "x".repeat(100))
+            .await
+            .unwrap();
+        let mut sec = SecurityContext::with_safe_defaults();
+        sec.limits.max_file_size = 50;
+        let ctx = ToolContext::new("grep-test")
+            .with_workspace(dir.clone())
+            .with_extension(sec);
+        let out = GrepTool
+            .execute(&ctx, r#"{"pattern":"needle","mode":"text"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("no matches"), "skips are not matches: {out}");
+        assert!(
+            out.contains("skipped 2 binary or oversized file(s)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("img.png") && !out.contains("big.txt"),
+            "{out}"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn grep_caps_shown_matches() {
+        let dir = std::env::temp_dir().join(format!("dnv-grep-cap-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("many.txt"), "hit\n".repeat(250))
+            .await
+            .unwrap();
+        let ctx = temp_ctx(&dir);
+        let out = GrepTool
+            .execute(&ctx, r#"{"pattern":"hit","mode":"text"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("250 match(es)"), "{out}");
+        assert!(out.contains("showing first 100"), "{out}");
+        assert!(out.contains("150 more matches not shown"), "{out}");
+        assert_eq!(out.matches("many.txt:").count(), MAX_MATCHES_SHOWN);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

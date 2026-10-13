@@ -107,6 +107,13 @@ pub struct GigaChatProvider {
     /// answer directly in `content`), or to a positive value to bound the
     /// thinking chain. `None` leaves it to the model default.
     reasoning_max_tokens: Option<u32>,
+    /// Function results already shrunk after a 413, keyed by the original
+    /// serialised content. History keeps the full tool output, so without this
+    /// every later request would hit the 413/shrink cycle again.
+    shrunk_results: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// `functions_state_id` per synthesised tool-call id, replayed on the
+    /// assistant message when its function result is in history.
+    state_ids: StateIds,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +219,21 @@ struct GigaDelta {
     reasoning_content: Option<String>,
     #[serde(default)]
     function_call: Option<GigaFunctionCall>,
+    /// Arrives in the same frame as `function_call`.
+    #[serde(default)]
+    functions_state_id: Option<String>,
+}
+
+/// Synthesised tool-call id → GigaChat `functions_state_id`. Sber documents
+/// that echoing the id on the assistant message preserves function-call state
+/// and improves answer quality.
+type StateIds = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+
+/// Record the `functions_state_id` returned with a tool call.
+fn remember_state_id(state_ids: &StateIds, call_id: &str, state_id: Option<String>) {
+    if let (Some(sid), Ok(mut map)) = (state_id, state_ids.lock()) {
+        map.insert(call_id.to_string(), sid);
+    }
 }
 
 /// Token usage reported by GigaChat. `precached_prompt_tokens` is the cached
@@ -338,6 +360,8 @@ impl GigaChatProvider {
             temperature,
             max_tokens,
             reasoning_max_tokens: None,
+            shrunk_results: std::sync::Mutex::new(std::collections::HashMap::new()),
+            state_ids: StateIds::default(),
         })
     }
 
@@ -529,6 +553,7 @@ impl GigaChatProvider {
                 _ => out.push(self.map_message(messages, m)),
             }
         }
+        supersede_covered_reads(&mut out);
         out
     }
 
@@ -574,13 +599,26 @@ impl GigaChatProvider {
                                 serde_json::Value::String(tc.function.arguments.clone())
                             }),
                         });
+                // Only with a paired result in history: a state id without one
+                // is rejected (422 "every assistant function call must have a
+                // result in history").
+                let functions_state_id = m
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|tc| tc.first())
+                    .filter(|tc| {
+                        all.iter().any(|x| {
+                            x.role == Role::Tool && x.tool_call_id.as_deref() == Some(&tc.id)
+                        })
+                    })
+                    .and_then(|tc| self.state_ids.lock().ok()?.get(&tc.id).cloned());
                 GigaMessage {
                     role: "assistant".to_string(),
                     content: m.content.clone(),
                     reasoning_content: None,
                     name: None,
                     function_call,
-                    functions_state_id: None,
+                    functions_state_id,
                 }
             }
             Role::Tool => {
@@ -595,6 +633,12 @@ impl GigaChatProvider {
                 // in a JSON object as a single value, matching the wire format
                 // the API documents for `role: "function"` results.
                 let result = giga_function_result(&m.content);
+                let result = self
+                    .shrunk_results
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get(&result).cloned())
+                    .unwrap_or(result);
                 GigaMessage {
                     role: "function".to_string(),
                     content: result,
@@ -717,6 +761,7 @@ impl GigaChatProvider {
         &self,
         body: &mut serde_json::Value,
     ) -> Result<reqwest::Response, DeepseeknovaError> {
+        let before = function_contents(body);
         let mut attempt = 0u32;
         loop {
             match self.send_request(body).await {
@@ -724,17 +769,54 @@ impl GigaChatProvider {
                     let Some((actual, max)) = parse_token_limit_error(&e) else {
                         return Err(e);
                     };
-                    // 0.85 margin: the server's count is not linear in length.
-                    let ratio = (max as f64 / actual.max(1) as f64) * 0.85;
-                    if !shrink_largest_function_result(body, ratio) {
+                    if !fit_function_budget(body, actual, max) {
                         return Err(e);
                     }
                     attempt += 1;
                 }
-                other => return other,
+                Ok(resp) => {
+                    if attempt > 0 {
+                        self.remember_shrunk(&before, &function_contents(body));
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => return Err(e),
             }
         }
     }
+
+    /// Record shrunk function results so later requests reuse them. `before`
+    /// may already hold cached shrunk values; those entries are updated under
+    /// their original key.
+    fn remember_shrunk(&self, before: &[String], after: &[String]) {
+        let Ok(mut cache) = self.shrunk_results.lock() else {
+            return;
+        };
+        for (old, new) in before.iter().zip(after) {
+            if old == new {
+                continue;
+            }
+            let key = cache
+                .iter()
+                .find(|(_, v)| *v == old)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| old.clone());
+            cache.insert(key, new.clone());
+        }
+    }
+}
+
+/// `content` of every `role: "function"` message in a request body, in order.
+fn function_contents(body: &serde_json::Value) -> Vec<String> {
+    body["messages"]
+        .as_array()
+        .map(|msgs| {
+            msgs.iter()
+                .filter(|m| m["role"] == "function")
+                .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolve the function name paired with a tool result, by locating the
@@ -786,7 +868,7 @@ fn ensure_object_properties(schema: serde_json::Value) -> serde_json::Value {
 
 /// How many times a `413 Tokens limit exceeded` is answered by shrinking the
 /// largest function result and resending.
-const MAX_SHRINK_RETRIES: u32 = 3;
+const MAX_SHRINK_RETRIES: u32 = 8;
 
 /// Parse GigaChat's `Tokens limit exceeded for index N: X (max M)` into
 /// `(X, M)`.
@@ -804,45 +886,296 @@ fn parse_token_limit_error(err: &DeepseeknovaError) -> Option<(usize, usize)> {
     Some((actual.parse().ok()?, max.parse().ok()?))
 }
 
-/// Truncate the largest `role: "function"` message in a request body to
-/// `ratio` of its characters, keeping `content` a valid JSON string. Returns
-/// `false` when there is no function result to shrink.
-fn shrink_largest_function_result(body: &mut serde_json::Value, ratio: f64) -> bool {
+/// Stub that replaces an older function result dropped to fit the budget.
+const OMITTED_RESULT: &str = "[omitted: earlier tool output dropped — GigaChat limits the total size of tool results in a request; re-run the tool if you need it again]";
+
+/// Rough GigaChat token estimate: CJK ≈ 1 token per char, other text ≈ ⅓.
+fn estimate_giga_tokens(text: &str) -> f64 {
+    let (cjk, other) = text.chars().fold((0usize, 0usize), |(c, o), ch| {
+        if ch as u32 >= 0x2E80 {
+            (c + 1, o)
+        } else {
+            (c, o + 1)
+        }
+    });
+    cjk as f64 + other as f64 / 3.0
+}
+
+/// Fit the request's function results into GigaChat's budget after a 413.
+///
+/// Measured: the 4096-token limit applies to the **sum of all function
+/// results** in the request (across turns), not to each one — two README
+/// halves pass alone and fail together. The server reports that sum
+/// (`actual`) and the limit (`max`). Oldest results are replaced with a stub
+/// first; the newest substantive result is protected and only shrunk as a
+/// last resort, so the model keeps what it just asked for.
+fn fit_function_budget(body: &mut serde_json::Value, actual: usize, max: usize) -> bool {
     let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return false;
     };
-    let Some(target) = msgs
-        .iter_mut()
-        .filter(|m| m["role"] == "function")
-        .max_by_key(|m| m["content"].as_str().map_or(0, |s| s.chars().count()))
-    else {
-        return false;
-    };
-    let content = target["content"].as_str().unwrap_or_default().to_string();
-    let inner = match serde_json::from_str::<serde_json::Value>(&content) {
-        Ok(serde_json::Value::Object(o)) if o.len() == 1 && o["result"].is_string() => {
-            o["result"].as_str().unwrap_or_default().to_string()
-        }
-        _ => content,
-    };
-    let total = inner.chars().count();
-    let keep = ((total as f64) * ratio) as usize;
-    if keep >= total {
+    let idxs: Vec<usize> = (0..msgs.len())
+        .filter(|&i| msgs[i]["role"] == "function")
+        .collect();
+    let est = |m: &serde_json::Value| estimate_giga_tokens(&function_result_text(m));
+    let total: f64 = idxs.iter().map(|&i| est(&msgs[i])).sum();
+    if total <= 0.0 {
         return false;
     }
-    let cut: String = inner.chars().take(keep).collect();
-    warn!(
-        kept_chars = keep,
-        total_chars = total,
-        "shrinking GigaChat function result after 413 token-limit rejection"
-    );
-    let marked = format!(
-        "{cut}\n…[вывод обрезан: показано {keep} из {total} символов — лимит GigaChat на результат функции; запроси нужный фрагмент точнее]"
-    );
+    // Margin: the server's count is not linear in length.
+    let keep = (max as f64 * 0.8 / actual.max(1) as f64).min(0.9);
+    let mut need = total * (1.0 - keep);
+    const SUBSTANTIVE: f64 = 50.0;
+    let protected = idxs
+        .iter()
+        .rev()
+        .copied()
+        .find(|&i| est(&msgs[i]) >= SUBSTANTIVE)
+        .or(idxs.last().copied());
+    let stub = serde_json::json!({ "result": OMITTED_RESULT }).to_string();
+    let stub_cost = estimate_giga_tokens(OMITTED_RESULT);
+    let mut changed = false;
+    for &i in &idxs {
+        if need <= 0.0 {
+            break;
+        }
+        let e = est(&msgs[i]);
+        if Some(i) == protected || e < SUBSTANTIVE {
+            continue;
+        }
+        msgs[i]["content"] = serde_json::Value::String(stub.clone());
+        need -= e - stub_cost;
+        changed = true;
+    }
+    if need > 0.0 {
+        if let Some(p) = protected {
+            let e = est(&msgs[p]);
+            let ratio = ((e - need) / e).clamp(0.05, 0.9);
+            changed |= shrink_function_at(msgs, p, ratio);
+        }
+    }
+    changed
+}
+
+/// Truncate the function message at `idx` to about `ratio` of its text; see [`fit_function_budget`].
+fn shrink_function_at(msgs: &mut [serde_json::Value], idx: usize, ratio: f64) -> bool {
+    let inner = function_result_text(&msgs[idx]);
+    // Only the newest read of a file may move its continuation point; an
+    // older result re-shrunk later would otherwise rewind it.
+    let latest = snippet_path(&inner).is_none_or(|p| {
+        !msgs[idx + 1..]
+            .iter()
+            .any(|m| m["role"] == "function" && snippet_path(&function_result_text(m)) == Some(p))
+    });
+    let target = &mut msgs[idx];
+    let name = target["name"].as_str().unwrap_or_default().to_string();
+    let Some(marked) = truncate_tool_output(&name, &inner, ratio, latest) else {
+        return false;
+    };
     target["content"] =
         serde_json::Value::String(serde_json::json!({ "result": marked }).to_string());
     true
 }
+
+/// Replace older `read_file` results whose shown lines a later read of the same
+/// file also shows with a short stub. Repeated reads otherwise pile up copies
+/// of the same file, and GigaChat applies its per-result limit to every one.
+/// Only the request is rewritten; the agent history keeps the full results.
+fn supersede_covered_reads(out: &mut [GigaMessage]) {
+    // Per path, the line ranges later reads show (`None` = the whole file).
+    let mut later: std::collections::HashMap<String, Vec<Option<(usize, usize)>>> =
+        std::collections::HashMap::new();
+    for m in out.iter_mut().rev() {
+        if m.role != "function" || m.name.as_deref() != Some("read_file") {
+            continue;
+        }
+        let text = function_result_text(&serde_json::json!({ "content": m.content }));
+        let Some(path) = snippet_path(&text).map(str::to_string) else {
+            continue;
+        };
+        let shown = shown_range(&text);
+        let seen = later.entry(path.clone()).or_default();
+        let covered = seen.iter().any(|l| match (l, shown) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some((a, b)), Some((c, d))) => *a <= c && d <= *b,
+        });
+        if covered {
+            m.content = serde_json::json!({
+                "result": format!(
+                    "[superseded: a later read_file of {path} in this conversation shows these lines]"
+                )
+            })
+            .to_string();
+        } else {
+            seen.push(shown);
+        }
+    }
+}
+
+/// Lines a `read_file` result actually shows: the truncation marker when the
+/// result was cut, else its `[Lines a-b of n]` header, else `None` (whole file).
+fn shown_range(text: &str) -> Option<(usize, usize)> {
+    let parse = |s: &str| -> Option<(usize, usize)> {
+        let (a, rest) = s.split_once('-')?;
+        let b: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        Some((a.trim().parse().ok()?, b.parse().ok()?))
+    };
+    // The real marker is appended last; earlier hits can be file content
+    // (e.g. reading this source file).
+    const MARKER: &str = "…[вывод обрезан лимитом GigaChat: показаны строки ";
+    if text.contains(MARKER) {
+        if let Some(r) = text.rsplit(MARKER).next().and_then(parse) {
+            return Some(r);
+        }
+    }
+    text.strip_prefix("[Lines ").and_then(parse)
+}
+
+/// Text of a `role: "function"` message: the `result` string when the content is
+/// our `{"result": …}` wrapper, else the raw content.
+fn function_result_text(msg: &serde_json::Value) -> String {
+    let content = msg["content"].as_str().unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(serde_json::Value::Object(o)) if o.len() == 1 && o["result"].is_string() => {
+            o["result"].as_str().unwrap_or_default().to_string()
+        }
+        _ => content.to_string(),
+    }
+}
+
+/// Absolute path from a `read_file` footer (`[Snippet generated from: …]`).
+fn snippet_path(text: &str) -> Option<&str> {
+    text.rsplit("[Snippet generated from: ")
+        .next()
+        .filter(|_| text.contains("[Snippet generated from: "))
+        .and_then(|s| s.lines().next())
+        .and_then(|l| l.strip_suffix(']'))
+}
+
+/// Footer `read_file` appends after the body; `edit_file` needs the snippet id
+/// from it, so truncation must keep it.
+const SNIPPET_FOOTER: &str = "\n\n[SNIPPET ID:";
+
+/// Cut a tool output's body to about `ratio` of its characters on a line
+/// boundary, keeping the `read_file` snippet footer, and append a marker that
+/// says what was shown and, for `read_file`, the exact call to continue.
+/// Returns `None` when nothing would be removed.
+fn truncate_tool_output(
+    name: &str,
+    output: &str,
+    ratio: f64,
+    record_progress: bool,
+) -> Option<String> {
+    let (body, footer) = match output.rfind(SNIPPET_FOOTER) {
+        Some(i) => output.split_at(i),
+        None => (output, ""),
+    };
+    // Ranged read_file output starts with `[Lines a-b of n]`.
+    let mut range: Option<(usize, usize, usize)> = None;
+    let mut text = body;
+    if let Some(rest) = body.strip_prefix("[Lines ") {
+        if let Some((head, after)) = rest.split_once("]\n") {
+            let parsed = head.split_once(" of ").and_then(|(ab, n)| {
+                let (a, b) = ab.split_once('-')?;
+                Some((a.parse().ok()?, b.parse().ok()?, n.parse().ok()?))
+            });
+            if parsed.is_some() {
+                range = parsed;
+                text = after;
+            }
+        }
+    }
+    // A previous cut left a top notice (carrying the file length) and a bottom
+    // marker; drop both so line counting stays exact.
+    let mut known_total: Option<usize> = None;
+    if let Some((first_line, rest)) = text.split_once('\n') {
+        if let Some(note) = first_line.strip_prefix(TOP_NOTICE) {
+            known_total = note
+                .split(" из ")
+                .nth(1)
+                .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse().ok());
+            text = rest;
+        }
+    }
+    if let Some(i) = text.rfind("\n…[вывод обрезан лимитом GigaChat") {
+        text = &text[..i];
+    }
+
+    let total_chars = text.chars().count();
+    let budget = ((total_chars as f64) * ratio) as usize;
+    if budget >= total_chars {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut used = 0usize;
+    let mut kept_lines = 0usize;
+    for line in &lines {
+        let cost = line.chars().count() + 1;
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept_lines += 1;
+    }
+    warn!(
+        tool = name,
+        kept_lines,
+        total_lines = lines.len(),
+        "shrinking GigaChat function result after 413 token-limit rejection"
+    );
+
+    let mut top_notice = String::new();
+    let (kept, marker) = if kept_lines == 0 {
+        // A single line longer than the budget: fall back to a character cut.
+        let cut: String = text.chars().take(budget).collect();
+        let note = format!(
+            "\n…[вывод обрезан лимитом GigaChat: показано {budget} из {total_chars} символов первой строки]"
+        );
+        (cut, note)
+    } else {
+        let kept = lines[..kept_lines].join("\n");
+        let note = if name == "read_file" {
+            let (first, file_total, range_end) = match range {
+                Some((a, b, n)) => (a, n, Some(b)),
+                None => (1, known_total.unwrap_or(lines.len()), None),
+            };
+            let last = first + kept_lines - 1;
+            let raw_path = snippet_path(footer);
+            if let Some(p) = raw_path.filter(|_| record_progress) {
+                if last < range_end.unwrap_or(file_total) {
+                    deepseeknova_core::read_progress::set_next_line(p, last + 1);
+                }
+            }
+            let path = raw_path
+                .map(|p| format!("path=\"{p}\""))
+                .unwrap_or_default();
+            top_notice = format!(
+                "{TOP_NOTICE}показаны строки {first}-{last} из {file_total}. Чтобы читать дальше, снова вызови read_file({path}) без start_line.\n"
+            );
+            format!(
+                "\n…[вывод обрезан лимитом GigaChat: показаны строки {first}-{last} из {file_total}. Чтобы читать дальше, снова вызови read_file({path}) без start_line — вывод продолжится со строки {}; start_line=0 — читать с начала]",
+                last + 1
+            )
+        } else {
+            format!(
+                "\n…[вывод обрезан лимитом GigaChat: показаны первые {kept_lines} из {} строк; сузь запрос, чтобы увидеть остальное]",
+                lines.len()
+            )
+        };
+        (kept, note)
+    };
+    let header = match range {
+        Some((a, _, n)) if kept_lines > 0 => format!("[Lines {a}-{} of {n}]\n", a + kept_lines - 1),
+        Some((a, b, n)) => format!("[Lines {a}-{b} of {n}]\n"),
+        None => String::new(),
+    };
+    Some(format!("{header}{top_notice}{kept}{marker}{footer}"))
+}
+
+/// First line of a truncated `read_file` body (right after its `[Lines]`
+/// header): models skim the start of a result and miss a trailing marker.
+const TOP_NOTICE: &str = "⚠ ФАЙЛ ВЫДАН НЕ ПОЛНОСТЬЮ: ";
 
 /// Serialise a tool result into the JSON string GigaChat expects on a
 /// `role: "function"` message. The API rejects (422) non-JSON `content`, so
@@ -921,8 +1254,10 @@ impl Provider for GigaChatProvider {
 
         let mut tool_calls: Vec<deepseeknova_core::types::ToolCall> = Vec::new();
         if let Some(fc) = choice.message.function_call {
+            let id = format!("call_{}", uuid::Uuid::new_v4());
+            remember_state_id(&self.state_ids, &id, choice.message.functions_state_id);
             tool_calls.push(deepseeknova_core::types::ToolCall {
-                id: format!("call_{}", uuid::Uuid::new_v4()),
+                id,
                 ty: "function".to_string(),
                 function: FunctionCall {
                     name: fc.name,
@@ -961,8 +1296,9 @@ impl Provider for GigaChatProvider {
 
             let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(64);
 
+            let state_ids = self.state_ids.clone();
             tokio::spawn(async move {
-                if let Err(e) = stream_gigachat_sse(response, &tx).await {
+                if let Err(e) = stream_gigachat_sse(response, &tx, state_ids).await {
                     let _ = tx.send(Err(e)).await;
                 }
             });
@@ -1002,6 +1338,7 @@ impl Provider for GigaChatProvider {
 struct GigaSseState<'a> {
     tx: &'a mpsc::Sender<Result<Chunk, DeepseeknovaError>>,
     done_sent: bool,
+    state_ids: StateIds,
 }
 
 /// Read a GigaChat SSE stream and emit parsed [`Chunk`]s. GigaChat streams
@@ -1009,6 +1346,7 @@ struct GigaSseState<'a> {
 async fn stream_gigachat_sse(
     response: reqwest::Response,
     tx: &mpsc::Sender<Result<Chunk, DeepseeknovaError>>,
+    state_ids: StateIds,
 ) -> Result<(), DeepseeknovaError> {
     let state = crate::sse::for_each_sse_line(
         response.bytes_stream(),
@@ -1016,10 +1354,11 @@ async fn stream_gigachat_sse(
         GigaSseState {
             tx,
             done_sent: false,
+            state_ids,
         },
         |line, mut st| async move {
             if !line.is_empty() {
-                process_sse_line(&line, st.tx, &mut st.done_sent).await?;
+                process_sse_line(&line, st.tx, &mut st.done_sent, &st.state_ids).await?;
             }
             Ok(st)
         },
@@ -1038,6 +1377,7 @@ async fn process_sse_line(
     line: &str,
     tx: &mpsc::Sender<Result<Chunk, DeepseeknovaError>>,
     done_sent: &mut bool,
+    state_ids: &StateIds,
 ) -> Result<(), DeepseeknovaError> {
     let Some(data) = line.strip_prefix("data:") else {
         if !line.starts_with(':') {
@@ -1110,6 +1450,7 @@ async fn process_sse_line(
         // not a call identity).
         if let Some(fc) = choice.delta.function_call {
             let id = format!("call_{}", uuid::Uuid::new_v4());
+            remember_state_id(state_ids, &id, choice.delta.functions_state_id);
             let name = fc.name;
             let arguments = fc.arguments.to_string();
             let _ = tx
@@ -1163,6 +1504,280 @@ mod tests {
         ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
             Ok("ok".into())
         }
+    }
+
+    struct LiveReadFile;
+
+    #[async_trait]
+    impl Tool for LiveReadFile {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "read_file".into(),
+                description: "Читает файл по пути.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Путь."}},"required":["path"]}),
+                few_shot_examples: None,
+                return_parameters: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _args: &str,
+        ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+            Ok("# Demo\nRust agent framework".into())
+        }
+    }
+
+    /// Live end-to-end check of `functions_state_id` replay against the real
+    /// API. Run manually: `GIGACHAT_AUTH_KEY=<base64 id:secret> cargo test -p
+    /// deepseeknova-provider live_functions_state_id -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "hits the real GigaChat API"]
+    async fn live_functions_state_id_roundtrip() {
+        use base64::Engine;
+        use tokio_stream::StreamExt;
+        let key = std::env::var("GIGACHAT_AUTH_KEY").expect("GIGACHAT_AUTH_KEY");
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .unwrap(),
+        )
+        .unwrap();
+        let (id, secret) = decoded.split_once(':').unwrap();
+        let p = GigaChatProvider::new(
+            None,
+            "GigaChat-2-Max",
+            None,
+            id.into(),
+            secret.into(),
+            None,
+            None,
+            None,
+            60,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let tool = LiveReadFile;
+        let tools: [&dyn Tool; 1] = [&tool];
+
+        let user = msg(
+            Role::User,
+            "Прочитай файл README.md инструментом read_file.",
+        );
+        let first = [user.clone()];
+        let mut stream = p
+            .stream(ValidatedRequest::new(&first, &tools).unwrap())
+            .await
+            .unwrap();
+        let mut call: Option<(String, String, String)> = None;
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::ToolCallEnd {
+                id,
+                name,
+                arguments,
+            } = chunk.unwrap()
+            {
+                call = Some((id, name, arguments));
+            }
+        }
+        let (call_id, name, arguments) = call.expect("model must call read_file");
+        let stored = p.state_ids.lock().unwrap().get(&call_id).cloned();
+        println!("tool call {name} {arguments}; stored functions_state_id = {stored:?}");
+        assert!(
+            stored.is_some(),
+            "functions_state_id not captured from stream"
+        );
+
+        let assistant = Message {
+            role: Role::Assistant,
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![deepseeknova_core::types::ToolCall {
+                id: call_id.clone(),
+                ty: "function".into(),
+                function: FunctionCall { name, arguments },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let result = Message {
+            role: Role::Tool,
+            content: "# Demo\nRust agent framework".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let history = [user, assistant, result];
+        let body = p.build_request(&history, &tools, false);
+        println!(
+            "replayed functions_state_id = {}",
+            body["messages"][1]["functions_state_id"]
+        );
+        assert_eq!(
+            body["messages"][1]["functions_state_id"].as_str(),
+            stored.as_deref()
+        );
+        let reply = p
+            .generate(ValidatedRequest::new(&history, &tools).unwrap())
+            .await
+            .expect("GigaChat must accept the replayed functions_state_id");
+        println!("second turn reply: {}", reply.content);
+    }
+
+    struct SchemaTool(ToolSchema);
+
+    #[async_trait]
+    impl Tool for SchemaTool {
+        fn schema(&self) -> ToolSchema {
+            self.0.clone()
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _args: &str,
+        ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+            Ok(String::new())
+        }
+    }
+
+    /// Live replay of a recorded session: rebuilds the history (user turns,
+    /// tool calls, tool results) and tool schemas from a trace and sends the
+    /// final request through this provider. Run manually:
+    /// `GIGACHAT_AUTH_KEY=… GIGACHAT_TRACE=<trace.jsonl> cargo test -p
+    /// deepseeknova-provider live_trace_replay -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "hits the real GigaChat API"]
+    async fn live_trace_replay_survives_token_limit() {
+        use base64::Engine;
+        let key = std::env::var("GIGACHAT_AUTH_KEY").expect("GIGACHAT_AUTH_KEY");
+        let trace = std::env::var("GIGACHAT_TRACE").expect("GIGACHAT_TRACE");
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .unwrap(),
+        )
+        .unwrap();
+        let (id, secret) = decoded.split_once(':').unwrap();
+
+        let mut schemas: Vec<SchemaTool> = Vec::new();
+        let mut history: Vec<Message> = Vec::new();
+        let mut text = String::new();
+        let mut model = String::from("GigaChat-2-Max");
+        for line in std::fs::read_to_string(&trace).unwrap().lines() {
+            let d: serde_json::Value = serde_json::from_str(line).unwrap();
+            let ev = &d["event"];
+            match (d["kind"].as_str(), ev["event"].as_str()) {
+                (Some("session_start"), _) => {
+                    model = d["model"].as_str().unwrap_or(&model).to_string();
+                    for t in d["tools"].as_array().unwrap() {
+                        schemas.push(SchemaTool(ToolSchema {
+                            name: t["name"].as_str().unwrap().into(),
+                            description: t["description"].as_str().unwrap().into(),
+                            parameters: t["parameters"].clone(),
+                            few_shot_examples: None,
+                            return_parameters: None,
+                        }));
+                    }
+                }
+                (Some("user_submit"), _) => {
+                    history.push(msg(Role::User, d["prompt"].as_str().unwrap()))
+                }
+                (_, Some("text_delta")) => text.push_str(ev["text"].as_str().unwrap()),
+                (_, Some("done")) => history.push(msg(Role::Assistant, &std::mem::take(&mut text))),
+                (_, Some("tool_call_end")) => history.push(Message {
+                    role: Role::Assistant,
+                    content: std::mem::take(&mut text),
+                    name: None,
+                    tool_calls: Some(vec![deepseeknova_core::types::ToolCall {
+                        id: ev["id"].as_str().unwrap().into(),
+                        ty: "function".into(),
+                        function: FunctionCall {
+                            name: ev["name"].as_str().unwrap().into(),
+                            arguments: ev["arguments"].as_str().unwrap().into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning_signature: None,
+                    usage: None,
+                }),
+                (_, Some("tool_result")) => history.push(Message {
+                    role: Role::Tool,
+                    content: ev["result"].as_str().unwrap().into(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: Some(ev["call_id"].as_str().unwrap().into()),
+                    reasoning_content: None,
+                    reasoning_signature: None,
+                    usage: None,
+                }),
+                _ => {}
+            }
+        }
+        let tools: Vec<&dyn Tool> = schemas.iter().map(|t| t as &dyn Tool).collect();
+        let p = GigaChatProvider::new(
+            None,
+            &model,
+            None,
+            id.into(),
+            secret.into(),
+            None,
+            None,
+            None,
+            60,
+            1,
+            None,
+            Some(16),
+        )
+        .unwrap();
+        println!(
+            "replaying {} messages, {} tools",
+            history.len(),
+            tools.len()
+        );
+        if std::env::var("GIGACHAT_TRACE_DEBUG").is_ok() {
+            let mut body = p.build_request(&history, &tools, false);
+            for attempt in 0..10 {
+                let sizes: Vec<(usize, usize)> = function_contents(&body)
+                    .iter()
+                    .map(|c| {
+                        let t = function_result_text(&serde_json::json!({ "content": c }));
+                        (
+                            t.chars().count(),
+                            t.chars().filter(|c| *c as u32 >= 0x2E80).count(),
+                        )
+                    })
+                    .collect();
+                match p.send_request(&body).await {
+                    Ok(_) => {
+                        println!("attempt {attempt}: OK; (chars, cjk) per result {sizes:?}");
+                        break;
+                    }
+                    Err(e) => {
+                        println!("attempt {attempt}: {e}; (chars, cjk) per result {sizes:?}");
+                        let Some((a, m)) = parse_token_limit_error(&e) else {
+                            break;
+                        };
+                        fit_function_budget(&mut body, a, m);
+                    }
+                }
+            }
+            return;
+        }
+        let reply = p
+            .generate(ValidatedRequest::new(&history, &tools).unwrap())
+            .await
+            .expect("replayed request must succeed without surfacing 413");
+        println!("reply: {:?}", reply.content);
     }
 
     #[allow(dead_code)]
@@ -1319,6 +1934,116 @@ mod tests {
         assert_eq!(fn_msg["content"], "{\"result\":\"12\"}");
     }
 
+    #[tokio::test]
+    async fn functions_state_id_is_replayed_only_with_paired_result() {
+        let p = provider();
+        let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(8);
+        let mut done_sent = false;
+        process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}},\"functions_state_id\":\"sid-1\"},\"finish_reason\":\"function_call\"}]}",
+            &tx,
+            &mut done_sent,
+            &p.state_ids,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut call_id = String::new();
+        while let Some(Ok(c)) = rx.recv().await {
+            if let Chunk::ToolCallStart { id, .. } = c {
+                call_id = id;
+            }
+        }
+        assert!(!call_id.is_empty());
+
+        let assistant = Message {
+            role: Role::Assistant,
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![deepseeknova_core::types::ToolCall {
+                id: call_id.clone(),
+                ty: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let result = Message {
+            role: Role::Tool,
+            content: "# Demo".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+
+        let paired = p.build_request(&[assistant.clone(), result], &[], false);
+        assert_eq!(paired["messages"][0]["functions_state_id"], "sid-1");
+
+        let unpaired = p.build_request(&[assistant], &[], false);
+        assert!(unpaired["messages"][0].get("functions_state_id").is_none());
+    }
+
+    #[test]
+    fn shrunk_function_result_is_reused_by_later_requests() {
+        let p = provider();
+        let assistant = Message {
+            role: Role::Assistant,
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![deepseeknova_core::types::ToolCall {
+                id: "call_1".to_string(),
+                ty: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let tool_result = Message {
+            role: Role::Tool,
+            content: "line\n".repeat(100),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let history = [assistant, tool_result];
+
+        let mut body = p.build_request(&history, &[], false);
+        let before = function_contents(&body);
+        assert!(shrink_at(&mut body, 1, 0.5));
+        let first = function_contents(&body);
+        p.remember_shrunk(&before, &first);
+        assert_eq!(
+            function_contents(&p.build_request(&history, &[], false)),
+            first
+        );
+
+        // A further shrink of an already-cached value updates the original key.
+        assert!(shrink_at(&mut body, 1, 0.5));
+        let second = function_contents(&body);
+        p.remember_shrunk(&first, &second);
+        assert_eq!(
+            function_contents(&p.build_request(&history, &[], false)),
+            second
+        );
+        assert_eq!(p.shrunk_results.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn paired_function_result_is_kept_and_orphan_is_dropped() {
         let p = provider();
@@ -1396,8 +2121,218 @@ mod tests {
         assert_eq!(parse_token_limit_error(&other), None);
     }
 
+    fn read_file_output(header: &str, body: &str) -> String {
+        format!("{header}{body}\n\n[SNIPPET ID: abc123]\n[Snippet generated from: /ws/README.md]\n")
+    }
+
     #[test]
-    fn shrinks_only_the_largest_function_result() {
+    fn truncated_read_file_reports_lines_and_continuation() {
+        let body: String = (1..=100)
+            .map(|i| format!("line {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out =
+            truncate_tool_output("read_file", &read_file_output("", &body), 0.3, true).unwrap();
+        assert!(out.contains("line 001"));
+        assert!(!out.contains("line 100"));
+        let last = out.lines().filter(|l| l.starts_with("line ")).count();
+        assert!(
+            out.contains(&format!("показаны строки 1-{last} из 100")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "read_file(path=\"/ws/README.md\") без start_line — вывод продолжится со строки {}",
+                last + 1
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            deepseeknova_core::read_progress::take_next_line("/ws/README.md"),
+            Some(last + 1),
+            "continuation point recorded for auto start_line"
+        );
+        assert!(out.ends_with("[Snippet generated from: /ws/README.md]\n"));
+        assert!(out.contains("[SNIPPET ID: abc123]"));
+    }
+
+    #[test]
+    fn truncated_read_has_top_notice_and_retruncation_keeps_file_length() {
+        let body: String = (1..=100)
+            .map(|i| format!("line {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let src = read_file_output("", &body).replace("/ws/README.md", "/ws/notice.md");
+        let once = truncate_tool_output("read_file", &src, 0.5, false).unwrap();
+        assert!(once.starts_with(TOP_NOTICE), "{once}");
+        assert!(once.lines().next().unwrap().contains("из 100"));
+
+        let twice = truncate_tool_output("read_file", &once, 0.5, false).unwrap();
+        assert!(twice.starts_with(TOP_NOTICE), "{twice}");
+        let first = twice.lines().next().unwrap();
+        assert!(first.contains("из 100"), "file length survives: {first}");
+        assert_eq!(twice.matches(TOP_NOTICE).count(), 1);
+        assert_eq!(twice.matches("…[вывод обрезан лимитом GigaChat").count(), 1);
+        let shown = twice.lines().filter(|l| l.starts_with("line ")).count();
+        assert!(
+            first.contains(&format!("строки 1-{shown} из 100")),
+            "{first}"
+        );
+    }
+
+    #[test]
+    fn truncated_ranged_read_keeps_range_and_end_line() {
+        let body: String = (50..=149)
+            .map(|i| format!("{i}: code"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = truncate_tool_output(
+            "read_file",
+            &read_file_output("[Lines 50-149 of 300]\n", &body)
+                .replace("/ws/README.md", "/ws/ranged.rs"),
+            0.5,
+            true,
+        )
+        .unwrap();
+        let kept = out.lines().filter(|l| l.ends_with(": code")).count();
+        let last = 50 + kept - 1;
+        assert!(
+            out.starts_with(&format!("[Lines 50-{last} of 300]\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("продолжится со строки {}", last + 1)),
+            "{out}"
+        );
+        assert_eq!(
+            deepseeknova_core::read_progress::take_next_line("/ws/ranged.rs"),
+            Some(last + 1)
+        );
+    }
+
+    fn fn_msg(text: String) -> GigaMessage {
+        GigaMessage {
+            role: "function".into(),
+            content: giga_function_result(&text),
+            reasoning_content: None,
+            name: Some("read_file".into()),
+            function_call: None,
+            functions_state_id: None,
+        }
+    }
+
+    #[test]
+    fn covered_older_reads_are_superseded_and_complementary_ones_kept() {
+        let rf = |header: &str, body: &str| read_file_output(header, body);
+        let mut out = vec![
+            // Full read shrunk to lines 1-107: lines 108+ only appear later.
+            fn_msg(rf(
+                "",
+                "1: a\n…[вывод обрезан лимитом GigaChat: показаны строки 1-107 из 333. …]",
+            )),
+            fn_msg(rf("[Lines 108-333 of 333]\n", "108: b")),
+            fn_msg(rf("[Lines 151-333 of 333]\n", "151: c")),
+            fn_msg(rf("[Lines 42-333 of 333]\n", "42: d")),
+            fn_msg(rf("[Lines 1-5 of 9]\n", "1: other").replace("/ws/README.md", "/ws/other.md")),
+        ];
+        supersede_covered_reads(&mut out);
+        let stubbed: Vec<bool> = out
+            .iter()
+            .map(|m| m.content.contains("[superseded"))
+            .collect();
+        assert_eq!(stubbed, vec![false, true, true, false, false]);
+    }
+
+    #[test]
+    fn shown_range_ignores_marker_text_inside_file_content() {
+        let src = "let s = \"…[вывод обрезан лимитом GigaChat: показаны строки {first}-{last}\";";
+        assert_eq!(shown_range(src), None);
+        assert_eq!(shown_range("[Lines 3-9 of 20]\n3: x"), Some((3, 9)));
+    }
+
+    #[test]
+    fn reshrinking_an_older_read_does_not_rewind_continuation() {
+        let path = "/ws/rewind-guard.md";
+        let read = |header: &str, from: usize, to: usize| {
+            let body: String = (from..=to)
+                .map(|i| format!("{i}: text"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let out = read_file_output(header, &body).replace("/ws/README.md", path);
+            serde_json::json!({"role": "function", "name": "read_file", "content": giga_function_result(&out)})
+        };
+        // Older full read is the largest; the newest read continues at 108.
+        let mut body = serde_json::json!({"messages": [
+            read("", 1, 300),
+            read("[Lines 108-150 of 300]\n", 108, 150),
+        ]});
+        deepseeknova_core::read_progress::set_next_line(path, 151);
+        assert!(shrink_at(&mut body, 0, 0.3));
+        assert_eq!(
+            deepseeknova_core::read_progress::take_next_line(path),
+            Some(151),
+            "older result must not move the point"
+        );
+
+        // When the newest read is the one shrunk, the point advances.
+        let mut body = serde_json::json!({"messages": [
+            read("[Lines 108-300 of 300]\n", 108, 300),
+        ]});
+        assert!(shrink_at(&mut body, 0, 0.3));
+        let next = deepseeknova_core::read_progress::take_next_line(path).unwrap();
+        assert!(next > 108 && next < 300, "{next}");
+    }
+
+    #[test]
+    fn truncated_other_tool_cuts_on_line_boundary() {
+        let body = "match a\nmatch b\nmatch c\nmatch d\n";
+        let out = truncate_tool_output("grep", body, 0.5, true).unwrap();
+        assert!(out.starts_with("match a\nmatch b\n…"), "{out}");
+        assert!(out.contains("показаны первые 2 из 4 строк"), "{out}");
+        assert!(truncate_tool_output("grep", body, 1.0, true).is_none());
+    }
+
+    fn shrink_at(body: &mut serde_json::Value, idx: usize, ratio: f64) -> bool {
+        shrink_function_at(body["messages"].as_array_mut().unwrap(), idx, ratio)
+    }
+
+    #[test]
+    fn budget_drops_oldest_results_first_and_protects_newest() {
+        let big = |c: char| giga_function_result(&c.to_string().repeat(1_500));
+        let mut body = serde_json::json!({"messages": [
+            {"role": "function", "name": "read_file", "content": big('a')},
+            {"role": "function", "name": "read_file", "content": big('b')},
+            {"role": "function", "name": "read_file", "content": big('c')},
+            {"role": "function", "name": "todo_write", "content": giga_function_result("ok")},
+        ]});
+        // Server: total 4500 over max 4096 → one old result is enough.
+        assert!(fit_function_budget(&mut body, 4500, 4096));
+        let texts: Vec<String> = function_contents(&body)
+            .iter()
+            .map(|c| function_result_text(&serde_json::json!({ "content": c })))
+            .collect();
+        assert_eq!(texts[0], OMITTED_RESULT, "oldest dropped first");
+        assert!(
+            texts[1].starts_with('b'),
+            "middle kept when enough was freed"
+        );
+        assert!(
+            texts[2].starts_with('c'),
+            "newest substantive result protected"
+        );
+        assert_eq!(texts[3], "ok");
+
+        // Only one substantive result: it is shrunk, not dropped.
+        let mut single = serde_json::json!({"messages": [
+            {"role": "function", "name": "read_file", "content": big('x')},
+        ]});
+        assert!(fit_function_budget(&mut single, 6000, 4096));
+        let t = function_result_text(&single["messages"][0]);
+        assert!(t.starts_with('x') && t.contains("вывод обрезан"), "{t}");
+    }
+
+    #[test]
+    fn shrink_function_at_keeps_json_and_marks_cut() {
         let big = giga_function_result(&"汉".repeat(1_000));
         let small = giga_function_result("ok");
         let mut body = serde_json::json!({"messages": [
@@ -1405,7 +2340,7 @@ mod tests {
             {"role": "function", "name": "a", "content": small},
             {"role": "function", "name": "b", "content": big},
         ]});
-        assert!(shrink_largest_function_result(&mut body, 0.5));
+        assert!(shrink_at(&mut body, 2, 0.5));
         assert_eq!(body["messages"][1]["content"], small);
         let shrunk: serde_json::Value =
             serde_json::from_str(body["messages"][2]["content"].as_str().unwrap())
@@ -1415,7 +2350,7 @@ mod tests {
         assert!(text.contains("вывод обрезан"));
 
         let mut no_fn = serde_json::json!({"messages": [{"role": "user", "content": "x"}]});
-        assert!(!shrink_largest_function_result(&mut no_fn, 0.5));
+        assert!(!fit_function_budget(&mut no_fn, 5000, 4096));
     }
 
     #[test]
@@ -1532,6 +2467,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();
@@ -1539,10 +2475,11 @@ mod tests {
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105,\"precached_prompt_tokens\":30}}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();
-        process_sse_line("data: [DONE]", &tx, &mut done_sent)
+        process_sse_line("data: [DONE]", &tx, &mut done_sent, &StateIds::default())
             .await
             .unwrap();
         drop(tx);
@@ -1578,6 +2515,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"рассуждение...\"}}]}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();
@@ -1585,6 +2523,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();
@@ -1616,6 +2555,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"weather\",\"arguments\":{\"city\":\"Москва\"}}}}]}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();
@@ -1836,6 +2776,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"weather\",\"arguments\":{\"city\":\"x\"}}},\"finish_reason\":\"error\"}]}",
             &tx,
             &mut done_sent,
+            &StateIds::default(),
         )
         .await
         .unwrap();

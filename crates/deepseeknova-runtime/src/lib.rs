@@ -70,8 +70,8 @@ separate graph-search tool before `grep` — the graph is already inside `grep`.
 - Use `mode=text` when you only need raw text/string literals.\n\
 - Then follow up with structure tools: `traverse_graph` (callers/callees),\n\
   `retrieve_entity view=skeleton` then `view=full`, `trace_code` (multi-hop),\n\
-  `impact_code` (blast radius), `explore_code`/`deps_code` (grouped source/\n\
-  imports).\n\
+  `impact_code` (blast radius), `deps_code` (imports). `retrieve_entity` also\n\
+  takes several `entities` and file paths (`path:a-b`).\n\
 \n\
 Give `grep` focused terms for the crate/subsystem, not one broad word: e.g.\n\
 `pattern: \"status|ctx_usage\"` or `terms: [\"tui\", \"status\"]`.\n\
@@ -83,6 +83,98 @@ wide scans are slow, noisy, and burn steps.\n\
 After you confirm a symbol is relevant, distill it with `tag_code` (entity\n\
 name + short semantic tags) so it stays findable in the code graph next time.\n\
 Tag only symbols you actually used to solve the task — never speculatively.";
+
+/// Russian [`GRAPH_RETRIEVAL_HINT`] for Russian-dialect providers (GigaChat),
+/// which follow native-language instructions far more reliably.
+const GRAPH_RETRIEVAL_HINT_RU: &str = "\n\n## Стратегия поиска кода\n\
+\n\
+`grep` — единая точка входа для поиска кода. По умолчанию (`mode=all`) он за\n\
+один вызов ищет И по тексту (regex), И по семантическому код-графу (символы) и\n\
+возвращает секции `[text]` и `[symbols]`. Не вызывай отдельный поиск по графу\n\
+перед `grep` — граф уже внутри `grep`.\n\
+\n\
+- Обычный `grep` (без `mode`) уже включает символы; в секции `[symbols]` ищи\n\
+  определяющий узел и точный путь:строку.\n\
+- `mode=symbols` (при необходимости с `terms`) — когда нужна только структура.\n\
+- `mode=text` — когда нужен только сырой текст и строковые литералы.\n\
+- Дальше — структурные тулы: `traverse_graph` (callers/callees),\n\
+  `retrieve_entity view=skeleton`, затем `view=full`, `trace_code` (многошаговые\n\
+  пути), `impact_code` (радиус влияния), `deps_code` (импорты). `retrieve_entity`\n\
+  принимает и несколько `entities`, и пути к файлам (`path:a-b`). Файлы целиком\n\
+  читай через `read_file`.\n\
+\n\
+Давай `grep` точные термины подсистемы, а не одно общее слово: например,\n\
+`pattern: \"status|ctx_usage\"` или `terms: [\"tui\", \"status\"]`.\n\
+\n\
+НЕ используй `bash ... grep -rn ... .` по корню репозитория. Сужай `grep`\n\
+через `path` (конкретный крейт или модуль) — сканы по всему корню медленные,\n\
+шумные и тратят шаги.\n\
+\n\
+Когда символ подтвердился как релевантный, размечай его через `tag_code` (имя\n\
+сущности + короткие семантические теги), чтобы в следующий раз он находился в\n\
+код-графе. Размечай только символы, реально использованные для решения задачи.";
+
+/// Retrieval hint for the `core` tool profile: graph-only tools are hidden
+/// there, so it names only offered tools.
+const GRAPH_RETRIEVAL_HINT_CORE: &str = "\n\n## Code Retrieval Strategy\n\
+\n\
+Answer questions about this project from the repository, not from memory:\n\
+- `grep` finds code: its default `mode=all` returns raw-text matches (`[text]`)\n\
+  and code-graph symbols (`[symbols]`). Scope it with `path`.\n\
+- `retrieve_entity` returns a symbol (`GraphIndex::open`), a file path or\n\
+  `path:a-b`; `view=full` gives source, `entities` takes several at once.\n\
+- `read_file` reads whole files (README.md, docs, configs).\n\
+Do NOT run `bash ... grep -rn` across the repository root.";
+
+/// Russian [`GRAPH_RETRIEVAL_HINT_CORE`].
+const GRAPH_RETRIEVAL_HINT_CORE_RU: &str = "\n\n## Стратегия поиска кода\n\
+\n\
+На вопросы о проекте отвечай по репозиторию, а не по памяти:\n\
+- `grep` ищет код: по умолчанию (`mode=all`) возвращает совпадения в тексте\n\
+  (`[text]`) и символы код-графа (`[symbols]`). Сужай поиск через `path`.\n\
+- `retrieve_entity` возвращает символ (`GraphIndex::open`), путь к файлу или\n\
+  `path:a-b`; `view=full` — исходник, `entities` — несколько сразу.\n\
+- `read_file` читает файлы целиком (README.md, документацию, конфиги).\n\
+НЕ используй `bash ... grep -rn` по корню репозитория.";
+
+/// Built-in tools offered to the model under the `core` tool profile.
+const CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "grep",
+    "bash",
+    "edit_file",
+    "write_file",
+    "ls",
+    "glob",
+    "retrieve_entity",
+    "skill",
+    "todo_write",
+];
+
+/// Resolve the tool profile: `auto` picks `core` for Russian-dialect
+/// providers (GigaChat), which choose tools far more reliably from a short
+/// list, and `full` for everything else.
+fn uses_core_profile(
+    profile: deepseeknova_config::ToolProfile,
+    lang: deepseeknova_core::PromptLang,
+) -> bool {
+    match profile {
+        deepseeknova_config::ToolProfile::Core => true,
+        deepseeknova_config::ToolProfile::Full => false,
+        deepseeknova_config::ToolProfile::Auto => lang == deepseeknova_core::PromptLang::Ru,
+    }
+}
+
+/// Retrieval hint in the provider dialect's language, limited to the tools
+/// the active profile offers.
+fn graph_retrieval_hint(lang: deepseeknova_core::PromptLang, core: bool) -> &'static str {
+    match (lang, core) {
+        (deepseeknova_core::PromptLang::Ru, true) => GRAPH_RETRIEVAL_HINT_CORE_RU,
+        (deepseeknova_core::PromptLang::Ru, false) => GRAPH_RETRIEVAL_HINT_RU,
+        (_, true) => GRAPH_RETRIEVAL_HINT_CORE,
+        (_, false) => GRAPH_RETRIEVAL_HINT,
+    }
+}
 
 /// 设计 C：运行时「会话边界」序号。每次 `build_agent` 递增一次，用作
 /// skill `record_use` 的会话 id——每次构造 = 新会话，跨 build 的 recall
@@ -222,13 +314,19 @@ pub fn build_agent_with_role_providers(
         } else {
             None
         };
+    let core_profile = uses_core_profile(config.tools.profile, provider.dialect().lang);
     let register = |agent: &mut deepseeknova_agent::Agent,
                     tools: Vec<Arc<dyn deepseeknova_core::Tool>>| {
         for tool in tools {
-            if disabled.contains(tool.schema().name.as_str()) {
+            let name = tool.schema().name;
+            if disabled.contains(name.as_str()) {
                 continue;
             }
-            agent.register_tool(tool);
+            if core_profile && !CORE_TOOLS.contains(&name.as_str()) {
+                agent.register_tool(Arc::new(deepseeknova_core::HiddenTool(tool)));
+            } else {
+                agent.register_tool(tool);
+            }
         }
     };
     if config.sandbox.enabled {
@@ -287,7 +385,7 @@ pub fn build_agent_with_role_providers(
     );
 
     // 技能工具：三层来源（builtin / user / project）按 scope 优先级解析，注册为
-    // `skill__<name>` 工具。可经 tools.overrides 按名禁用（精确匹配 skill__<name>）。
+    // 单个 `skill(name)` 工具。可经 tools.overrides 禁用整个 `skill` 或单个 `skill__<name>`。
     // 用户级目录 `~/.deepseeknova/skills`，项目级 `.deepseeknova/skills`（后加者
     // 覆盖 `.agents/skills`）。
     // 激活 deprecated 过滤：从 `<workspace_root>/.deepseeknova/skills/fitness.json`
@@ -297,7 +395,7 @@ pub fn build_agent_with_role_providers(
     // 来源生效。
     {
         use deepseeknova_core::registry::SkillScope;
-        use deepseeknova_skills::{SkillResolver, SkillTool};
+        use deepseeknova_skills::{SkillResolver, SkillsTool};
         let user_skills = dirs::home_dir()
             .map(|h| h.join(".deepseeknova/skills"))
             .unwrap_or_default();
@@ -316,25 +414,30 @@ pub fn build_agent_with_role_providers(
             .add_source(SkillScope::User, user_skills)
             .add_source(SkillScope::Project, ".deepseeknova/skills")
             .add_source(SkillScope::Project, ".agents/skills");
-        let skill_tools: Vec<Arc<dyn deepseeknova_core::Tool>> = resolver
+        let skills: Vec<_> = resolver
             .resolve()
             .into_iter()
-            .map(|s| Arc::new(SkillTool::new(s)) as Arc<dyn deepseeknova_core::Tool>)
+            .filter(|s| !disabled.contains(format!("skill__{}", s.name).as_str()))
             .collect();
-        if !skill_tools.is_empty() {
-            register(&mut agent, skill_tools);
+        if let Some(tool) = SkillsTool::new(skills) {
+            register(&mut agent, vec![Arc::new(tool)]);
         }
     }
 
     // Dynamically-discovered tools (MCP, etc). Same disable-filter as built-ins;
     // their namespaced names (`mcp__server__tool`) can be toggled via overrides.
-    register(&mut agent, extra_tools);
+    // The user configured them explicitly, so the tool profile never hides them.
+    for tool in extra_tools {
+        if !disabled.contains(tool.schema().name.as_str()) {
+            agent.register_tool(tool);
+        }
+    }
 
     // 句柄提升到外层，供主 agent 与子代理共享（delegate 需要）。
     let mut graph_ext: Option<deepseeknova_tools::GraphHandle> = None;
     let mut memory_ext: Option<deepseeknova_tools::MemoryHandle> = None;
 
-    // 高级图查询工具（trace_code / impact_code / explore_code）：仅在代码图启用时
+    // 高级图查询工具（trace_code / impact_code / deps_code / tag_code）：仅在代码图启用时
     // 注册，与三个基础图工具「禁用时不可见」的行为等价。注册点保持在 runtime，
     // 不改动 all_builtin 工具列表（其 schema 预算测试在 tools crate 内冻结）。
     if config.graph.enabled {
@@ -365,7 +468,10 @@ pub fn build_agent_with_role_providers(
                 });
                 agent = agent.with_extension(handle.clone());
                 graph_ext = Some(handle.clone());
-                agent = agent.with_appended_system_prompt(GRAPH_RETRIEVAL_HINT);
+                agent = agent.with_appended_system_prompt(graph_retrieval_hint(
+                    provider.dialect().lang,
+                    core_profile,
+                ));
 
                 // Feed a repo map into the agent's system prompt at run start.
                 // Personalization seeds are extracted from the user query via

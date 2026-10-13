@@ -162,6 +162,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether the tool schema is offered to the model. Hidden tools stay
+    /// callable by name (the agent's post-edit LSP / tag hints invoke them
+    /// internally) but are not sent to the provider. Default: `true`.
+    fn advertised(&self) -> bool {
+        true
+    }
+
     /// Execute the tool with the given JSON arguments string.
     ///
     /// 返回 [`crate::DeepseeknovaError`] 而非 `anyhow::Error`，让调用方可按
@@ -173,4 +180,45 @@ pub trait Tool: Send + Sync {
         ctx: &ToolContext,
         args: &str,
     ) -> Result<String, crate::DeepseeknovaError>;
+}
+
+/// Wraps a tool so it stays registered and callable by name but is not
+/// offered to the model ([`Tool::advertised`] = `false`). Every other trait
+/// method delegates to the inner tool, so permissions and scheduling are
+/// unchanged.
+pub struct HiddenTool(pub Arc<dyn Tool>);
+
+#[async_trait]
+impl Tool for HiddenTool {
+    fn schema(&self) -> ToolSchema {
+        self.0.schema()
+    }
+
+    fn safety(&self) -> ParallelSafety {
+        self.0.safety()
+    }
+
+    fn read_only(&self) -> bool {
+        self.0.read_only()
+    }
+
+    fn parallelizable(&self) -> bool {
+        self.0.parallelizable()
+    }
+
+    fn writes_fs(&self) -> bool {
+        self.0.writes_fs()
+    }
+
+    fn advertised(&self) -> bool {
+        false
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        args: &str,
+    ) -> Result<String, crate::DeepseeknovaError> {
+        self.0.execute(ctx, args).await
+    }
 }

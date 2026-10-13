@@ -443,6 +443,26 @@ pub struct ToolsConfig {
     /// LSP 编辑后诊断工具配置（`lsp_diagnostics`）。
     #[serde(default)]
     pub lsp: LspConfig,
+
+    /// Which built-in tools are offered to the model (`auto` | `core` | `full`).
+    #[serde(default)]
+    pub profile: ToolProfile,
+}
+
+/// Built-in tool set offered to the model. Tools outside the profile stay
+/// registered (hidden) so internal callers such as post-edit LSP diagnostics
+/// keep working; MCP tools are always offered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProfile {
+    /// `core` for Russian-dialect providers (GigaChat), `full` otherwise.
+    #[default]
+    Auto,
+    /// File, shell and navigation essentials only (~11 tools); chat-tuned
+    /// models pick tools more reliably from a short list.
+    Core,
+    /// Every built-in tool.
+    Full,
 }
 
 /// 单个工具的覆盖配置。
@@ -2237,6 +2257,9 @@ impl ToolsConfig {
         }
         self.web_search.merge(other.web_search);
         self.lsp.merge(other.lsp);
+        if other.profile != ToolProfile::Auto {
+            self.profile = other.profile;
+        }
     }
 }
 
@@ -3931,6 +3954,21 @@ mod tests {
             c.tools.lsp.servers.get("rust").map(String::as_str),
             Some("/opt/rust-analyzer")
         );
+    }
+
+    #[test]
+    fn tools_profile_parses_and_merges() {
+        assert_eq!(Config::default().tools.profile, ToolProfile::Auto);
+        let core: Config = toml::from_str("[tools]\nprofile = \"core\"\n").unwrap();
+        assert_eq!(core.tools.profile, ToolProfile::Core);
+        assert!(toml::from_str::<Config>("[tools]\nprofile = \"tiny\"\n").is_err());
+
+        let mut user = core.clone();
+        user.merge(Config::default());
+        assert_eq!(user.tools.profile, ToolProfile::Core, "auto must not clear");
+        let full: Config = toml::from_str("[tools]\nprofile = \"full\"\n").unwrap();
+        user.merge(full);
+        assert_eq!(user.tools.profile, ToolProfile::Full);
     }
 
     #[test]

@@ -219,7 +219,14 @@ async fn build_agent_wires_graph_when_enabled() {
     assert!(names.iter().any(|n| n == "retrieve_entity"));
     assert!(names.iter().any(|n| n == "trace_code"));
     assert!(names.iter().any(|n| n == "impact_code"));
-    assert!(names.iter().any(|n| n == "explore_code"));
+    // tag_status is registered for the post-edit distill hint but never offered.
+    assert!(names.iter().any(|n| n == "tag_status"));
+    use deepseeknova_core::runner::Runner;
+    assert!(!agent
+        .debug_config()
+        .tools
+        .iter()
+        .any(|t| t.name == "tag_status"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -384,7 +391,6 @@ fn build_agent_skips_graph_when_disabled() {
     assert!(!agent.tool_names().iter().any(|n| n == "retrieve_entity"));
     assert!(!agent.tool_names().iter().any(|n| n == "trace_code"));
     assert!(!agent.tool_names().iter().any(|n| n == "impact_code"));
-    assert!(!agent.tool_names().iter().any(|n| n == "explore_code"));
 }
 
 /// deprecated 过滤端到端激活：workspace 下 fitness.json 标记的已弃用技能
@@ -411,15 +417,65 @@ fn build_agent_excludes_deprecated_skills() {
     config.memory.enabled = false;
     let provider = std::sync::Arc::new(stub_provider());
     let agent = build_agent(&config, root, provider, 5, None, vec![]).unwrap();
-    let names = agent.tool_names();
+    use deepseeknova_core::runner::Runner;
+    let skill = agent
+        .debug_config()
+        .tools
+        .into_iter()
+        .find(|t| t.name == "skill")
+        .expect("single skill tool registered");
+    let names = skill.parameters["properties"]["name"]["enum"].to_string();
     assert!(
-        !names.iter().any(|n| n == "skill__coding-copilot"),
-        "deprecated skill must not be registered, got {names:?}"
+        !names.contains("\"coding-copilot\""),
+        "deprecated skill must not be offered, got {names}"
     );
     assert!(
-        names.iter().any(|n| n == "skill__frontend-developer"),
-        "non-deprecated builtin must still be registered, got {names:?}"
+        names.contains("\"frontend-developer\""),
+        "non-deprecated builtin must still be offered, got {names}"
     );
+    assert!(!agent.tool_names().iter().any(|n| n.starts_with("skill__")));
+}
+
+#[test]
+fn core_tool_profile_hides_non_core_tools_but_keeps_them_registered() {
+    use deepseeknova_core::runner::Runner;
+    let mut config = Config::default();
+    config.graph.enabled = false;
+    config.memory.enabled = false;
+    config.tools.profile = deepseeknova_config::ToolProfile::Core;
+    let provider = std::sync::Arc::new(stub_provider());
+    let agent = build_agent(&config, std::env::temp_dir(), provider, 5, None, vec![]).unwrap();
+
+    let offered: Vec<String> = agent
+        .debug_config()
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        offered.iter().all(|n| CORE_TOOLS.contains(&n.as_str())),
+        "{offered:?}"
+    );
+    assert!(offered.iter().any(|n| n == "read_file"), "{offered:?}");
+
+    let registered = agent.tool_names();
+    for hidden in ["lsp_diagnostics", "web_fetch", "ask_user"] {
+        assert!(
+            registered.iter().any(|n| n == hidden) && !offered.iter().any(|n| n == hidden),
+            "{hidden} must stay registered but hidden"
+        );
+    }
+}
+
+#[test]
+fn auto_tool_profile_is_core_only_for_russian_dialect() {
+    use deepseeknova_config::ToolProfile;
+    use deepseeknova_core::PromptLang;
+    assert!(uses_core_profile(ToolProfile::Auto, PromptLang::Ru));
+    assert!(!uses_core_profile(ToolProfile::Auto, PromptLang::En));
+    assert!(!uses_core_profile(ToolProfile::Auto, PromptLang::Zh));
+    assert!(uses_core_profile(ToolProfile::Core, PromptLang::En));
+    assert!(!uses_core_profile(ToolProfile::Full, PromptLang::Ru));
 }
 
 #[tokio::test]
@@ -919,6 +975,50 @@ fn graph_retrieval_hint_stays_english_and_graph_first() {
         !GRAPH_RETRIEVAL_HINT.contains("检索"),
         "hint must be English, not Chinese"
     );
+}
+
+#[test]
+fn graph_retrieval_hint_is_russian_for_russian_dialect() {
+    use deepseeknova_core::PromptLang;
+    let ru = graph_retrieval_hint(PromptLang::Ru, false);
+    assert!(ru.contains("Стратегия поиска кода"));
+    for tool in [
+        "grep",
+        "traverse_graph",
+        "retrieve_entity",
+        "tag_code",
+        "mode=symbols",
+    ] {
+        assert!(ru.contains(tool), "RU hint missing {tool}");
+    }
+    assert_eq!(
+        graph_retrieval_hint(PromptLang::En, false),
+        GRAPH_RETRIEVAL_HINT
+    );
+    assert!(!GRAPH_RETRIEVAL_HINT.contains("explore_code"));
+}
+
+#[test]
+fn core_profile_hint_names_only_offered_tools() {
+    use deepseeknova_core::PromptLang;
+    for hint in [
+        graph_retrieval_hint(PromptLang::Ru, true),
+        graph_retrieval_hint(PromptLang::En, true),
+    ] {
+        for hidden in [
+            "traverse_graph",
+            "trace_code",
+            "impact_code",
+            "deps_code",
+            "tag_code",
+        ] {
+            assert!(!hint.contains(hidden), "core hint mentions hidden {hidden}");
+        }
+        for offered in ["grep", "retrieve_entity", "read_file"] {
+            assert!(hint.contains(offered), "core hint missing {offered}");
+        }
+    }
+    assert!(graph_retrieval_hint(PromptLang::Ru, true).contains("Стратегия поиска кода"));
 }
 
 #[test]

@@ -12,8 +12,8 @@
 //! rather than going silently untranslated.
 
 use crate::prompt_dialect::{PromptDialect, PromptLang};
-use crate::types::ToolSchema;
-use serde_json::Value;
+use crate::types::{FewShotExample, ToolSchema};
+use serde_json::{json, Value};
 
 /// Rewrite a tool schema's description (and every nested parameter
 /// `description`) into the dialect's native language. English dialects and
@@ -30,6 +30,13 @@ pub fn localize_tool_schema(schema: ToolSchema, dialect: PromptDialect) -> ToolS
         PromptLang::En => {}
     }
     let description = match dialect.lang {
+        // `skill` lists the installed skills after a fixed lead-in; translate
+        // only the lead-in.
+        PromptLang::Ru if schema.name == "skill" => schema.description.replacen(
+            "Activates a skill and returns its instructions to follow. Skills:",
+            "Активирует навык и возвращает его инструкции, которым нужно следовать. Навыки:",
+            1,
+        ),
         PromptLang::Ru => tool_desc_ru(&schema.name)
             .unwrap_or(&schema.description)
             .to_string(),
@@ -38,11 +45,70 @@ pub fn localize_tool_schema(schema: ToolSchema, dialect: PromptDialect) -> ToolS
             .to_string(),
         PromptLang::En => schema.description,
     };
+    let few_shot_examples = match dialect.lang {
+        PromptLang::Ru => schema
+            .few_shot_examples
+            .or_else(|| few_shot_ru(&schema.name)),
+        _ => schema.few_shot_examples,
+    };
     ToolSchema {
         description,
         parameters,
+        few_shot_examples,
         ..schema
     }
+}
+
+/// Russian `few_shot_examples` (GigaChat) for the core navigation tools. They
+/// teach chat-tuned models that questions about the project are answered by
+/// calling tools, not from memory.
+fn few_shot_ru(name: &str) -> Option<Vec<FewShotExample>> {
+    let ex = |request: &str, params: Value| FewShotExample {
+        request: request.to_string(),
+        params,
+    };
+    Some(match name {
+        "read_file" => vec![
+            ex("о чём этот проект?", json!({"path": "README.md"})),
+            ex(
+                "покажи строки 120-180 файла src/lib.rs",
+                json!({"path": "src/lib.rs", "start_line": 120, "end_line": 180}),
+            ),
+        ],
+        "grep" => vec![
+            ex(
+                "где определяется функция build_agent?",
+                json!({"pattern": "fn build_agent", "mode": "all"}),
+            ),
+            ex(
+                "какие провайдеры поддерживаются в crates/deepseeknova-provider?",
+                json!({"pattern": "kind|provider", "path": "crates/deepseeknova-provider/src", "mode": "text"}),
+            ),
+        ],
+        "glob" => vec![ex(
+            "найди все конфигурационные файлы toml",
+            json!({"pattern": "**/*.toml"}),
+        )],
+        "ls" => vec![ex(
+            "какая структура у каталога crates?",
+            json!({"path": "crates"}),
+        )],
+        "retrieve_entity" => vec![
+            ex(
+                "покажи код метода GraphIndex::open",
+                json!({"entity": "GraphIndex::open", "view": "full"}),
+            ),
+            ex(
+                "какие функции есть в src/router.rs?",
+                json!({"entity": "src/router.rs"}),
+            ),
+        ],
+        "bash" => vec![ex(
+            "какие файлы изменены в git?",
+            json!({"command": "git status --short"}),
+        )],
+        _ => return None,
+    })
 }
 
 /// Recursively rewrite every `"description"` string in a parameter schema.
@@ -85,8 +151,17 @@ fn tool_desc_ru(name: &str) -> Option<&'static str> {
         "forget" => "Удаляет память по ключу из межсессионного хранилища.",
         "recall" => "Ищет в межсессионном хранилище по семантическому сходству с запросом. Возвращает top_k совпавших записей с key, value и tags.",
         "traverse_graph" => "Обходит соседей сущности в код-графе (callers/callees/both) до 3 хопов. Используй для понимания отношений вызовов и радиуса влияния.",
-        "retrieve_entity" => "Извлекает кодовую сущность из код-графа. view=skeleton — doc-комментарии + сигнатуры (компактно); view=full — строки исходника с номерами (с лимитом токенов; полный исходник читай через read_file).",
+        "retrieve_entity" => "Извлекает сущности кода (символы или пути к файлам, можно `path:a-b`) из код-графа. view=skeleton — doc-комментарии + сигнатуры (компактно); view=full — строки исходника с номерами (с лимитом токенов; полный исходник читай через read_file).",
         "ask_user" => "Задаёт пользователю уточняющий вопрос и возвращает его ответ. Используй только когда решение действительно требует ввода пользователя.",
+        "context7_docs" => "Получает актуальные фрагменты документации сторонних библиотек из Context7.",
+        "delegate" => "Поручает подзадачу субагенту; рекурсия разрешена до предельной глубины.",
+        "deps_code" => "Показывает импорты и внешние зависимости файла.",
+        "impact_code" => "Оценивает радиус влияния рефакторинга: кто достигает сущности.",
+        "lsp_diagnostics" => "Запускает языковой сервер на файле и возвращает текущую диагностику (ошибки/предупреждения с номерами строк). Используй после правки кода, чтобы поймать ошибки компиляции и типов.",
+        "tag_code" => "Записывает семантические теги на сущность кода, релевантность которой подтверждена. Сохраняется, чтобы будущие поиски символов находили её по словам.",
+        "tag_status" => "Сообщает, сколько символов файла уже имеют семантические теги в код-графе. Используй, чтобы решить, нужна ли разметка через tag_code.",
+        "trace_code" => "Прослеживает многошаговые пути вызовов, включая динамическую диспетчеризацию.",
+        "web_search" => "Ищет в интернете и возвращает ранжированные результаты (заголовок, URL, фрагмент).",
         _ => return None,
     })
 }
@@ -132,7 +207,8 @@ fn common_ru(en: &str) -> Option<&'static str> {
         "URL." => "URL.",
         "Pattern." => "Шаблон.",
         "Dir (default: cwd)." => "Каталог (по умолчанию: cwd).",
-        "First line (1-based)." => "Первая строка (с 1).",
+        "First line (1-based); omit: resume a truncated read; 0: from start." =>
+            "Первая строка (с 1). Не указывай — продолжить с места, где оборвался обрезанный предыдущий вывод этого файла, иначе с начала. 0 — с начала.",
         "Last line (1-based)." => "Последняя строка (с 1).",
         "Search." => "Поиск.",
         "Replace." => "Замена.",
@@ -159,6 +235,40 @@ fn common_ru(en: &str) -> Option<&'static str> {
             "text=только regex; symbols=только код-граф; all=оба (по умолчанию).",
         "Explicit code-graph search terms (default: derived from pattern)." =>
             "Явные поисковые термины код-графа (по умолчанию: выводятся из pattern).",
+        "Skill name." => "Имя навыка.",
+        "Several at once." => "Несколько сущностей сразу (вместо `entity`).",
+        "Agent." => "Агент.",
+        "Context." => "Контекст.",
+        "Goal." => "Цель.",
+        "Depth (6 default, cap 6)." => "Глубина (по умолчанию 6, макс 6).",
+        "Edges (default calls,references,dispatch)." => "Рёбра (по умолчанию calls,references,dispatch).",
+        "Entities to explore (grouped by file)." => "Сущности для просмотра (группируются по файлам).",
+        "Entity to estimate impact for." => "Сущность, для которой оценивается влияние.",
+        "Entity to trace." => "Сущность для трассировки.",
+        "File path, relative to the workspace root." => "Путь к файлу относительно корня рабочей области.",
+        "Include external dependencies (default true)." => "Включать внешние зависимости (по умолчанию true).",
+        "Library name (e.g. serde)." => "Название библиотеки (например, serde).",
+        "Maximum results (default: config value, capped at 10)." =>
+            "Максимум результатов (по умолчанию из конфигурации, не больше 10).",
+        "Optional Context7 library id like /owner/repo; skips search." =>
+            "Необязательный id библиотеки Context7 вида /owner/repo; пропускает поиск.",
+        "Optional language override: rust|python|go|typescript|c|cpp." =>
+            "Необязательное переопределение языка: rust|python|go|typescript|c|cpp.",
+        "Output cap (6000 default)." => "Лимит вывода (по умолчанию 6000).",
+        "Path direction (default both)." => "Направление путей (по умолчанию both).",
+        "Search query." => "Поисковый запрос.",
+        "Semantic keywords describing what this entity does (e.g. [\"trace\", \"span\", \"metric\"])." =>
+            "Семантические ключевые слова о том, что делает сущность (например, [\"trace\", \"span\", \"metric\"]).",
+        "Symbol name (as returned by grep mode=symbols)." => "Имя символа (как его возвращает grep mode=symbols).",
+        "Symbol/file; its file's deps are shown. Omit for workspace external-deps summary." =>
+            "Символ или файл; показываются зависимости его файла. Не указывай для сводки внешних зависимостей рабочей области.",
+        "Topic or question (e.g. derive Serialize)." => "Тема или вопрос (например, derive Serialize).",
+        "Values for task-spec placeholders (${{ inputs.x }}). Ignored for presets without declared inputs." =>
+            "Значения для плейсхолдеров спецификации задачи (${{ inputs.x }}). Игнорируются для пресетов без объявленных inputs.",
+        "deps=what it imports; dependents=who imports it (default both)." =>
+            "deps — что импортирует; dependents — кто импортирует его (по умолчанию both).",
+        "full=source lines (default); skeleton=doc+signatures." =>
+            "full — строки исходника (по умолчанию); skeleton — документация и сигнатуры.",
         _ => return None,
     })
 }
@@ -180,7 +290,8 @@ fn common_zh(en: &str) -> Option<&'static str> {
         "URL." => "URL。",
         "Pattern." => "模式。",
         "Dir (default: cwd)." => "目录（默认：cwd）。",
-        "First line (1-based)." => "首行（从 1 起）。",
+        "First line (1-based); omit: resume a truncated read; 0: from start." =>
+            "首行（从 1 起）。省略：从该文件上次被截断的读取处继续，否则从头读；0：从头读。",
         "Last line (1-based)." => "末行（从 1 起）。",
         "Search." => "搜索内容。",
         "Replace." => "替换内容。",
@@ -308,6 +419,66 @@ mod tests {
         for n in names {
             assert!(tool_desc_ru(n).is_some(), "missing RU description for {n}");
             assert!(tool_desc_zh(n).is_some(), "missing ZH description for {n}");
+        }
+    }
+
+    #[test]
+    fn russian_dialect_adds_few_shot_examples_only_when_absent() {
+        let schema = |few| ToolSchema {
+            name: "read_file".into(),
+            description: "Reads a file.".into(),
+            parameters: json!({"type":"object"}),
+            few_shot_examples: few,
+            return_parameters: None,
+        };
+        let ru_schema = localize_tool_schema(schema(None), ru());
+        let ex = ru_schema
+            .few_shot_examples
+            .expect("RU few-shot for read_file");
+        assert_eq!(ex[0].params["path"], "README.md");
+
+        let own = vec![FewShotExample {
+            request: "x".into(),
+            params: json!({"path": "a"}),
+        }];
+        let kept = localize_tool_schema(schema(Some(own)), ru());
+        assert_eq!(kept.few_shot_examples.unwrap()[0].request, "x");
+
+        assert!(localize_tool_schema(schema(None), zh())
+            .few_shot_examples
+            .is_none());
+    }
+
+    #[test]
+    fn skill_lead_in_is_translated_and_skill_list_kept() {
+        let schema = ToolSchema {
+            name: "skill".into(),
+            description:
+                "Activates a skill and returns its instructions to follow. Skills:\n- dna-spec: Specs"
+                    .into(),
+            parameters: json!({"type":"object"}),
+            few_shot_examples: None,
+            return_parameters: None,
+        };
+        let ru_schema = localize_tool_schema(schema, ru());
+        assert!(ru_schema.description.starts_with("Активирует навык"));
+        assert!(ru_schema.description.ends_with("- dna-spec: Specs"));
+    }
+
+    #[test]
+    fn graph_and_agent_tools_have_russian_description() {
+        for n in [
+            "context7_docs",
+            "delegate",
+            "deps_code",
+            "impact_code",
+            "lsp_diagnostics",
+            "tag_code",
+            "tag_status",
+            "trace_code",
+            "web_search",
+        ] {
+            assert!(tool_desc_ru(n).is_some(), "missing RU description for {n}");
         }
     }
 }

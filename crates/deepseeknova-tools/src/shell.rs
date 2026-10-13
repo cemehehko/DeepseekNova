@@ -208,7 +208,7 @@ impl Tool for ShellTool {
         let stderr = String::from_utf8_lossy(&err).to_string();
 
         if status.success() {
-            Ok(cap_output(stdout, max_output, overflow))
+            Ok(head_tail(cap_output(stdout, max_output, overflow)))
         } else {
             let code = status.code().unwrap_or(-1);
             let mut msg = format!("command exited with code {code}");
@@ -218,11 +218,47 @@ impl Tool for ShellTool {
             if !stderr.is_empty() {
                 msg.push_str(&format!("\nSTDERR:\n{stderr}"));
             }
-            Err(DeepseeknovaError::tool(cap_output(
+            Err(DeepseeknovaError::tool(head_tail(cap_output(
                 msg, max_output, overflow,
-            )))
+            ))))
         }
     }
+}
+
+/// Characters of command output returned to the model. `max_output_bytes`
+/// guards memory (10 MB by default); this keeps one result from flooding the
+/// context.
+const MODEL_OUTPUT_CHARS: usize = 30_000;
+
+/// Keep the first and last lines of oversized output (60/40 split of
+/// [`MODEL_OUTPUT_CHARS`]) with a note saying how much was omitted.
+fn head_tail(s: String) -> String {
+    if s.chars().count() <= MODEL_OUTPUT_CHARS {
+        return s;
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let take = |budget: usize, iter: &mut dyn Iterator<Item = &&str>| {
+        let mut used = 0;
+        let mut n = 0;
+        for l in iter {
+            used += l.chars().count() + 1;
+            if used > budget {
+                break;
+            }
+            n += 1;
+        }
+        n
+    };
+    let head = take(MODEL_OUTPUT_CHARS * 3 / 5, &mut lines.iter());
+    let tail = take(MODEL_OUTPUT_CHARS * 2 / 5, &mut lines.iter().rev()).min(lines.len() - head);
+    let omitted = &lines[head..lines.len() - tail];
+    let omitted_chars: usize = omitted.iter().map(|l| l.chars().count() + 1).sum();
+    format!(
+        "{}\n... [{} lines / {omitted_chars} chars omitted; narrow the command (e.g. `| grep`, `| head`) or redirect to a file and read ranges]\n{}",
+        lines[..head].join("\n"),
+        omitted.len(),
+        lines[lines.len() - tail..].join("\n")
+    )
 }
 
 /// Cap a string to `max` bytes (on a char boundary), appending a truncation
@@ -362,6 +398,20 @@ mod tests {
         let out = cap_output("short".to_string(), Some(64), false);
         assert_eq!(out, "short");
         assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends_of_oversized_output() {
+        let small = "a\nb\n".to_string();
+        assert_eq!(head_tail(small.clone()), small);
+
+        let big: String = (0..5000).map(|i| format!("line {i:05}\n")).collect();
+        let out = head_tail(big);
+        assert!(out.chars().count() < MODEL_OUTPUT_CHARS + 200);
+        assert!(out.starts_with("line 00000\n"));
+        assert!(out.ends_with("line 04999"));
+        assert!(out.contains("lines /"), "{}", &out[..200]);
+        assert!(out.contains("chars omitted"));
     }
 
     #[test]
