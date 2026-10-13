@@ -158,6 +158,8 @@ impl Tool for GrepTool {
                 },
                 "required": ["pattern"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

@@ -68,6 +68,8 @@ impl Tool for TodoWriteTool {
                 },
                 "required": ["todos"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

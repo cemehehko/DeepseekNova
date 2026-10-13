@@ -208,6 +208,31 @@ impl ModelRouter {
         Ok(built)
     }
 
+    /// Eagerly warm up (and validate) the provider backing `role` — for
+    /// OAuth backends this performs the token exchange so auth errors surface
+    /// at startup. No-op for API-key providers. `model_override` routes via
+    /// [`Self::provider_for_maybe_model`].
+    pub async fn warmup(
+        &self,
+        role: ModelRole,
+        model_override: Option<&str>,
+    ) -> Result<(), deepseeknova_core::DeepseeknovaError> {
+        self.provider_for_maybe_model(role, model_override, None)?
+            .warmup()
+            .await
+    }
+
+    /// Whether the provider backing `model` authenticates via OAuth (e.g.
+    /// GigaChat), which requires an eager background warm-up rather than a
+    /// static API key. `None` falls back to the first configured provider.
+    pub fn is_oauth(&self, model: Option<&str>) -> bool {
+        let cfg = match model {
+            Some(m) => self.config.resolve_provider_for_model(m),
+            None => self.config.providers.first(),
+        };
+        cfg.is_some_and(|p| p.kind.as_str() == "gigachat")
+    }
+
     /// Number of distinct cached raw provider instances (for tests/insight).
     pub fn cached_instances(&self) -> usize {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -293,6 +318,15 @@ mod tests {
         assert!(r.set_pointer(ModelRole::Quick, "no-such").is_err());
         r.set_pointer(ModelRole::Quick, "small").unwrap();
         assert_eq!(r.pointer(ModelRole::Quick).as_deref(), Some("small"));
+    }
+
+    // warmup для API-key провайдера возвращает Ok немедленно (default no-op
+    // в Provider trait), а is_oauth корректно различает OAuth-диалекты.
+    #[tokio::test]
+    async fn warmup_is_noop_for_api_key_providers() {
+        let r = router(); // deepseek (openai) — не OAuth
+        assert!(!r.is_oauth(Some("big")));
+        r.warmup(ModelRole::Main, Some("big")).await.unwrap();
     }
 
     #[test]

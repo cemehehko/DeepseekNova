@@ -2535,6 +2535,8 @@ mod tests {
                 name: self.name.to_string(),
                 description: "flaky tool".to_string(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(
@@ -2670,6 +2672,8 @@ mod tests {
                 name: self.name.to_string(),
                 description: "ok tool".to_string(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(
@@ -2695,6 +2699,8 @@ mod tests {
                 name: "write_file".to_string(),
                 description: "barrier tool".to_string(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(

@@ -560,7 +560,8 @@ impl SubAgentRunner {
             .lock()
             .unwrap_or_else(recover_poisoned)
             .clone();
-        let mut system_prompt = crate::prompts::compose_sub_agent_prompt(&config.system_prompt);
+        let mut system_prompt =
+            crate::prompts::compose_sub_agent_prompt_for(provider.dialect(), &config.system_prompt);
         if !config.frozen_denies.is_empty() {
             system_prompt.push_str("\n\n## 禁止操作（父级冻结，不可执行）\n");
             system_prompt.push_str(&config.frozen_denies.join("\n"));
@@ -1456,6 +1457,8 @@ mod tests {
                     name: "dummy".to_string(),
                     description: "a dummy tool".to_string(),
                     parameters: json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(
@@ -2065,6 +2068,8 @@ mod tests {
                 name: "write_file".to_string(),
                 description: "writes a file".into(),
                 parameters: serde_json::json!({}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(
@@ -2089,6 +2094,8 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "reads".into(),
                 parameters: serde_json::json!({}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(
@@ -2349,6 +2356,8 @@ mod tests {
                     name: "block".to_string(),
                     description: "blocks forever".to_string(),
                     parameters: serde_json::json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(
@@ -2418,6 +2427,8 @@ mod tests {
                     name: "long".to_string(),
                     description: "long output tool".to_string(),
                     parameters: serde_json::json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(
@@ -2489,6 +2500,8 @@ mod tests {
                     name: "t".to_string(),
                     description: "ok tool".to_string(),
                     parameters: serde_json::json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(
@@ -2542,6 +2555,8 @@ mod tests {
                     name: "delegate".to_string(),
                     description: "recursive delegate stub".to_string(),
                     parameters: serde_json::json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(

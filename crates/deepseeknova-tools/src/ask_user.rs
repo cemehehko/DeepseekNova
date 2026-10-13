@@ -40,6 +40,8 @@ impl Tool for AskUserTool {
                 },
                 "required": ["question"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

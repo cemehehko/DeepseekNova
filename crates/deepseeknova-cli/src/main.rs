@@ -105,7 +105,7 @@ use deepseeknova_core::planner::SimplePlanner;
 use deepseeknova_core::runner::{RunEventStream, RunInput, Runner};
 use deepseeknova_core::{DeepseeknovaError, RunEvent};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
@@ -126,6 +126,13 @@ fn redact_config_for_display(config: &deepseeknova_config::Config) -> deepseekno
     for provider in &mut copy.providers {
         if provider.api_key.is_some() {
             provider.api_key = Some("[REDACTED]".to_string());
+        }
+        // GigaChat OAuth-секреты: и раздельная пара, и единый base64-«ключ».
+        if provider.client_secret.is_some() {
+            provider.client_secret = Some("[REDACTED]".to_string());
+        }
+        if provider.auth_key.is_some() {
+            provider.auth_key = Some("[REDACTED]".to_string());
         }
         for header in &mut provider.headers {
             if SENSITIVE_HEADERS.contains(&header.name.to_ascii_lowercase().as_str()) {
@@ -976,6 +983,32 @@ async fn run_cli() -> Result<i32, DeepseeknovaError> {
                     })
                     .unwrap_or(false);
                 tui = tui.with_config_status(!config.providers.is_empty(), api_key_configured);
+                // 启动授权状态：OAuth-провайдер (gigachat) → фоновый warm-up
+                // (молния ⚡ зажигается, когда OAuth завершён); API-key модели →
+                // `NotRequired` (готовность = наличие ключа, уже вычислено выше).
+                let pcfg = resolve_provider_cfg(&config, effective_model.as_deref()).ok();
+                let is_oauth = pcfg.is_some_and(|p| p.kind.as_str() == "gigachat");
+                let auth_state = Arc::new(Mutex::new(if is_oauth {
+                    deepseeknova_provider::ProviderAuthState::Warming
+                } else {
+                    deepseeknova_provider::ProviderAuthState::NotRequired
+                }));
+                if is_oauth {
+                    let router = Arc::clone(&model_router);
+                    let model = effective_model.clone();
+                    let state = Arc::clone(&auth_state);
+                    tokio::spawn(async move {
+                        let result = router.warmup(ModelRole::Main, model.as_deref()).await;
+                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                        *guard = match result {
+                            Ok(()) => deepseeknova_provider::ProviderAuthState::Ready,
+                            Err(e) => {
+                                deepseeknova_provider::ProviderAuthState::Failed(e.to_string())
+                            }
+                        };
+                    });
+                }
+                tui = tui.with_auth_state(auth_state);
                 // 工作区上下文：当前路径 + git 分支（状态行展示）。
                 let workspace_cwd = std::env::current_dir()
                     .map(|p| p.display().to_string())

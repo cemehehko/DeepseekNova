@@ -133,6 +133,8 @@ fn prompt_builder_basic_output() {
         name: "read_file".into(),
         description: "Reads a file".into(),
         parameters: serde_json::json!({"type": "object", "properties": {}}),
+        few_shot_examples: None,
+        return_parameters: None,
     }];
 
     let wm = WorkingMemory::new();

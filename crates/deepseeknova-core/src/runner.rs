@@ -7,11 +7,44 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use tokio_stream::StreamExt;
 
+/// A serializable description of a single tool the runner will expose to the
+/// model (name + description + parameter schema). Used for trace/debug logging
+/// so a future session can reproduce exactly which tools (and in which
+/// language) the model saw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerToolInfo {
+    /// Tool name.
+    pub name: String,
+    /// Tool description (already localised to the provider dialect).
+    pub description: String,
+    /// Parameter JSON schema (localised).
+    pub parameters: serde_json::Value,
+}
+
+/// Diagnosic snapshot of the runner's prompt + tool configuration, used by
+/// frontends (TUI trace) to record exactly what is sent to the model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunnerDebugConfig {
+    /// The effective system prompt the runner injects (`None` when the runner
+    /// does not use one).
+    pub system_prompt: Option<String>,
+    /// The tool schemas the runner exposes, in dialect-localised form.
+    pub tools: Vec<RunnerToolInfo>,
+}
+
 /// Runner is the execution abstraction. Agent, Planner, Coordinator,
 /// SubAgent, and ServerRunner all implement it. Runtime doesn't
 /// discriminate between them.
 #[async_trait::async_trait]
 pub trait Runner: Send + Sync {
+    /// Diagnostic snapshot of what this runner will send to the model (system
+    /// prompt + tool schemas). Defaults to empty; concrete runners that
+    /// actually inject a prompt or tools override this so the trace log can
+    /// faithfully record the model's view.
+    fn debug_config(&self) -> RunnerDebugConfig {
+        RunnerDebugConfig::default()
+    }
+
     /// Streaming run — returns a stream of events.
     ///
     /// 返回 [`crate::DeepseeknovaError`] 而非 `anyhow::Error`。stream 的

@@ -72,6 +72,8 @@ impl Tool for DelegateTool {
                 },
                 "required": ["agent", "goal"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -409,6 +411,8 @@ mod tests {
                     name: "block".to_string(),
                     description: "blocks forever".to_string(),
                     parameters: serde_json::json!({}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(

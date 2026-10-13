@@ -34,6 +34,8 @@ impl Tool for GlobTool {
                 },
                 "required": ["pattern"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

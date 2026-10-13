@@ -162,8 +162,10 @@ pub(crate) fn build_delegate_engine(
             })
             .cloned()
             .collect();
-        let composed_prompt =
-            deepseeknova_agent::prompts::compose_sub_agent_prompt(&p.system_prompt);
+        let composed_prompt = deepseeknova_agent::prompts::compose_sub_agent_prompt_for(
+            provider.dialect(),
+            &p.system_prompt,
+        );
         let mut sub = deepseeknova_agent::Agent::new(Arc::clone(&provider), p.spec.max_steps)
             .with_workspace_root(workspace_root.to_path_buf())
             .with_security(security.clone())

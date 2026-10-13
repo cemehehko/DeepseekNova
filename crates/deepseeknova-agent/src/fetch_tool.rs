@@ -35,6 +35,8 @@ impl Tool for FetchFullResultTool {
                 },
                 "required": ["tool_call_id"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

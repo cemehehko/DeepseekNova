@@ -36,6 +36,12 @@ impl MentionAwareRunner {
 
 #[async_trait]
 impl Runner for MentionAwareRunner {
+    /// Delegate to the main agent so the trace session_start records the real
+    /// system prompt + tool schemas (the wrapper itself injects none).
+    fn debug_config(&self) -> deepseeknova_core::runner::RunnerDebugConfig {
+        self.main.debug_config()
+    }
+
     async fn run_stream(&self, input: RunInput) -> Result<RunEventStream, DeepseeknovaError> {
         let known = self.sub.agent_names();
         match resolve_mention(&input.prompt, &known)? {

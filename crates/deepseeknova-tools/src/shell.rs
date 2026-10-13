@@ -67,6 +67,8 @@ impl Tool for ShellTool {
                 },
                 "required": ["command"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

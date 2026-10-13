@@ -94,6 +94,8 @@ impl Tool for WebSearchTool {
                 },
                 "required": ["query"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

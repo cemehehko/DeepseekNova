@@ -132,6 +132,8 @@ impl Tool for StubTool {
             name: "stub".to_string(),
             description: "stub tool for tests".to_string(),
             parameters: Value::Null,
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -283,6 +285,8 @@ impl Tool for NamedTool {
             name: self.name.to_string(),
             description: "named stub".to_string(),
             parameters: Value::Null,
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

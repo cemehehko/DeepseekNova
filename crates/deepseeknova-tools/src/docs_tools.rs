@@ -218,6 +218,8 @@ impl Tool for Context7DocsTool {
                 },
                 "required": ["library", "query"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

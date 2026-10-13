@@ -95,6 +95,8 @@ impl Tool for LspDiagnosticsTool {
                 },
                 "required": ["path"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

@@ -135,6 +135,9 @@ pub struct TuiRunner {
     provider_configured: bool,
     /// 当前 provider 的 API key 可解析（内联或环境变量）。
     api_key_configured: bool,
+    /// 当前 provider 的启动授权状态（OAuth warm-up 进度）。由 CLI 后台
+    /// warm-up 任务写入共享 Arc，渲染循环每帧读取以驱动 ⚡ 指示器。
+    auth_state: Arc<Mutex<deepseeknova_provider::ProviderAuthState>>,
     /// 工作区路径（状态行展示）。
     workspace_cwd: String,
     /// 当前 git 分支（非 git 工作区为 None）。
@@ -178,6 +181,9 @@ impl TuiRunner {
             project_rule_count: 0,
             provider_configured: false,
             api_key_configured: false,
+            auth_state: Arc::new(Mutex::new(
+                deepseeknova_provider::ProviderAuthState::NotRequired,
+            )),
             workspace_cwd: String::new(),
             git_branch: None,
             lang: Lang::from_env(),
@@ -248,6 +254,17 @@ impl TuiRunner {
     ) -> Self {
         self.provider_configured = provider_configured;
         self.api_key_configured = api_key_configured;
+        self
+    }
+
+    /// 注入启动授权状态（OAuth warm-up 进度）。CLI 侧创建共享
+    /// `Arc<Mutex<ProviderAuthState>>` 并在后台 warm-up 任务中写入；
+    /// 渲染循环每帧读取以驱动 ⚡ 指示器。缺省为 `NotRequired`。
+    pub fn with_auth_state(
+        mut self,
+        state: Arc<Mutex<deepseeknova_provider::ProviderAuthState>>,
+    ) -> Self {
+        self.auth_state = state;
         self
     }
 
@@ -412,6 +429,7 @@ impl TuiRunner {
             factory: self.factory.clone(),
             router: self.router.clone(),
             permission: self.permission.clone(),
+            auth_state: self.auth_state.clone(),
         };
         let mut caps = TuiCaps {
             runtime: Arc::new(Mutex::new(runtime)),
@@ -436,6 +454,11 @@ impl TuiRunner {
             tr,
             provider_configured: self.provider_configured,
             api_key_configured: self.api_key_configured,
+            auth_state: self
+                .auth_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             effort_label: self
                 .current_effort
                 .effort_str()
@@ -468,11 +491,14 @@ impl TuiRunner {
         // SessionStart 首行。打开失败静默降级（trace 不阻塞 TUI 启动）。
         if let Some(dir) = &self.trace_dir {
             if let Ok(mut store) = TraceStore::open(dir) {
+                let debug = self.runner.debug_config();
                 let _ = store.write(&TraceEvent::SessionStart {
                     ts: trace::unix_millis(),
                     dir: dir.display().to_string(),
                     model: self.model_label.clone(),
                     lang: format!("{:?}", lang),
+                    system_prompt: debug.system_prompt,
+                    tools: debug.tools,
                 });
                 app.trace = Some(store);
             }

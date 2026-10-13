@@ -1546,6 +1546,8 @@ mod security_fix_tests {
                 name: "bash".to_string(),
                 description: "fix regression test tool".to_string(),
                 parameters: Value::Null,
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
 

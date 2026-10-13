@@ -39,6 +39,8 @@ impl McpToolAdapter {
                 name: namespaced,
                 description,
                 parameters: tool_def.input_schema.clone(),
+                few_shot_examples: None,
+                return_parameters: None,
             },
             server_name,
             client,
@@ -226,6 +228,8 @@ impl Tool for McpResourceTool {
                 "properties": {"uri": {"type": "string", "description": "Resource URI."}},
                 "required": ["uri"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -299,6 +303,8 @@ impl Tool for McpPromptTool {
                 },
                 "required": ["name"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

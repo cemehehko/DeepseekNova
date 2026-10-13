@@ -696,6 +696,8 @@ impl deepseeknova_core::Tool for NamedStubTool {
             name: self.0.to_string(),
             description: "stub".into(),
             parameters: serde_json::json!({"type": "object"}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     async fn execute(

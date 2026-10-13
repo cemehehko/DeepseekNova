@@ -114,4 +114,23 @@ pub struct ToolSchema {
     pub description: String,
     /// 参数 JSON Schema。
     pub parameters: serde_json::Value,
+    /// GigaChat-ориентированные примеры «запрос → аргументы», повышающие
+    /// качество выбора функции у chat-моделей (Sber `few_shot_examples`).
+    /// `None` = не отправлять.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub few_shot_examples: Option<Vec<FewShotExample>>,
+    /// GigaChat `return_parameters` — описание структуры результата функции.
+    /// `None` = не отправлять.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_parameters: Option<serde_json::Value>,
+}
+
+/// Один пример «запрос пользователя → ожидаемые аргументы функции» для
+/// `few_shot_examples` GigaChat. Повышает качество генерации аргументов.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FewShotExample {
+    /// Запрос пользователя, на который модель должна сгенерировать аргументы.
+    pub request: String,
+    /// Ожидаемые аргументы вызова функции для этого запроса.
+    pub params: serde_json::Value,
 }

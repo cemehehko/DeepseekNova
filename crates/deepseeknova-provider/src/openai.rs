@@ -696,6 +696,8 @@ mod tests {
                 name: "noop".into(),
                 description: "does nothing".into(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
 

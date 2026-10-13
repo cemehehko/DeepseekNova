@@ -17,6 +17,8 @@ impl Tool for BenchTool {
             name: self.name.to_string(),
             description: "benchmark tool".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

@@ -13,6 +13,7 @@ use crate::i18n::Key;
 use deepseeknova_core::runner::Runner;
 use deepseeknova_provider::factory::ReasoningEffort;
 use deepseeknova_provider::router::ModelRouter;
+use deepseeknova_provider::ProviderAuthState;
 
 /// 命令参数规格（命令面板补全/提示用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,9 @@ pub struct TuiRuntime {
     pub router: Option<Arc<ModelRouter>>,
     /// 共享 PermissionGate（Ctrl+P / `/mode` 模式切换、信任确认）。
     pub permission: Option<Arc<deepseeknova_permission::PermissionGate>>,
+    /// 当前 provider 的启动授权状态（OAuth warm-up 进度；API-key 模型为
+    /// `NotRequired`）。由 CLI 后台 warm-up 任务写入，渲染循环每帧读取。
+    pub auth_state: Arc<Mutex<ProviderAuthState>>,
 }
 
 impl Default for TuiRuntime {
@@ -105,6 +109,7 @@ impl Default for TuiRuntime {
             factory: None,
             router: None,
             permission: None,
+            auth_state: Arc::new(Mutex::new(ProviderAuthState::NotRequired)),
         }
     }
 }

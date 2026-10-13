@@ -246,6 +246,8 @@ mod tests {
                 name: self.name.to_string(),
                 description: "recording write tool".to_string(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         fn read_only(&self) -> bool {

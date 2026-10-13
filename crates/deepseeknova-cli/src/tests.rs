@@ -35,11 +35,13 @@ fn config_display_redacts_inline_keys_and_auth_headers() {
         cache_prompt_key: None,
         cache_exact: None,
         oauth_url: None,
+        auth_key: None,
         client_id: None,
         client_secret: None,
         scope: None,
         session_id: None,
         rq_uid: None,
+        text_tool_calls: None,
     });
 
     let shown = redact_config_for_display(&config);

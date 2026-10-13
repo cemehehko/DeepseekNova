@@ -260,6 +260,14 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub oauth_url: Option<String>,
 
+    /// GigaChat «ключ авторизации»（`kind = "gigachat"`）：один base64-токен
+    /// вида `base64(client_id:client_secret)`, как его выдаёт Сбер и принимает
+    /// официальный SDK (поле `credentials`). При наличии приоритетен над
+    /// `client_id`/`client_secret` — провайдер сам декодирует и расщепляет
+    /// его для OAuth Basic-auth. Удобнее хранить один секрет вместо двух.
+    #[serde(default)]
+    pub auth_key: Option<String>,
+
     /// GigaChat OAuth `client_id`（`kind = "gigachat"`）。
     #[serde(default)]
     pub client_id: Option<String>,
@@ -280,6 +288,15 @@ pub struct ProviderConfig {
     /// GigaChat OAuth заголовок `RqUID`（необязательный; `None` = сгенерировать).
     #[serde(default)]
     pub rq_uid: Option<String>,
+
+    /// Извлекать tool-вызовы из текстового ответа chat-моделей (например
+    /// `read_file(path="x")` в markdown-блоке), когда нативный `function_call`
+    /// отсутствует — chat-модели (GigaChat и подобные) иногда «рисуют» вызов
+    /// инструмента текстом вместо wire-`function_call`. `None`/`false` = выкл
+    /// (по умолчанию); `true` = обернуть провайдер декоратором
+    /// `ToolCallExtractProvider`, который синтезирует настоящие tool-call.
+    #[serde(default)]
+    pub text_tool_calls: Option<bool>,
 }
 
 fn default_timeout() -> u64 {
@@ -2968,11 +2985,13 @@ mod tests {
                 cache_exact: None,
                 context_window: None,
                 oauth_url: None,
+                auth_key: None,
                 client_id: None,
                 client_secret: None,
                 scope: None,
                 session_id: None,
                 rq_uid: None,
+                text_tool_calls: None,
             }],
             ..Config::default()
         };

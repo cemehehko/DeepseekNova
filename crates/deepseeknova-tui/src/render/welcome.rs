@@ -16,6 +16,7 @@ use ratatui::Frame;
 use crate::app::state::AppState;
 use crate::i18n::Key;
 use crate::theme::Theme;
+use deepseeknova_provider::ProviderAuthState;
 
 /// 欢迎屏 logo 行（我们自己的 DEEPSEEKN 字标，6 行大号 ASCII 方块字）。
 ///
@@ -146,10 +147,21 @@ fn top_bar_spans(app: &AppState, theme: &Theme) -> Line<'static> {
     } else {
         format!("{}:{}", app.workspace_cwd, branch)
     };
+    // ⚡ индикатор готовности провайдера: горит когда
+    //   * OAuth-провайдер прошёл warm-up (`Ready`), либо
+    //   * API-key провайдер (`NotRequired`) и ключ разрешился.
+    // При `Warming` / `Failed` — только имя модели без молнии.
+    let lightning = match &app.auth_state {
+        ProviderAuthState::Ready => true,
+        ProviderAuthState::NotRequired => app.api_key_configured,
+        ProviderAuthState::Warming | ProviderAuthState::Failed(_) => false,
+    };
     let model = if app.model_label.is_empty() {
         String::new()
-    } else {
+    } else if lightning {
         format!("⚡ {}", app.model_label)
+    } else {
+        app.model_label.clone()
     };
     Line::from(vec![
         Span::styled(location, theme.system),
@@ -356,5 +368,40 @@ mod tests {
                 render_welcome(&app, &theme, f, area);
             })
             .unwrap();
+    }
+
+    // ⚡ индикатор должен отражать статус аутентификации провайдера, а не
+    // только факт выбранной модели.
+    #[test]
+    fn lightning_semantics_follow_auth_state() {
+        use deepseeknova_provider::ProviderAuthState;
+        let theme = Theme::default();
+        let lightning_in = |app: &AppState| {
+            let line = top_bar_spans(app, &theme);
+            line.spans.iter().any(|s| s.content.contains('⚡'))
+        };
+
+        // API-key провайдер + ключ есть → молния горит.
+        let mut app = sample_app();
+        app.auth_state = ProviderAuthState::NotRequired;
+        app.api_key_configured = true;
+        assert!(lightning_in(&app));
+
+        // API-key провайдер без ключа → молния не горит.
+        app.api_key_configured = false;
+        assert!(!lightning_in(&app));
+
+        // OAuth warm-up в процессе → молния не горит.
+        app.auth_state = ProviderAuthState::Warming;
+        app.api_key_configured = true;
+        assert!(!lightning_in(&app));
+
+        // OAuth завершён → молния горит.
+        app.auth_state = ProviderAuthState::Ready;
+        assert!(lightning_in(&app));
+
+        // OAuth провален → молния не горит.
+        app.auth_state = ProviderAuthState::Failed("bad creds".into());
+        assert!(!lightning_in(&app));
     }
 }

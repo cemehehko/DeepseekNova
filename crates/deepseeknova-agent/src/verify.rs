@@ -349,6 +349,8 @@ mod tests {
                 name: "bash".to_string(),
                 description: "fake bash".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(

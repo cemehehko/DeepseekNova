@@ -217,6 +217,10 @@ impl CachingProvider {
 
 #[async_trait]
 impl Provider for CachingProvider {
+    fn dialect(&self) -> deepseeknova_core::PromptDialect {
+        self.inner.dialect()
+    }
+
     async fn generate(
         &self,
         validated: ValidatedRequest<'_>,
@@ -311,6 +315,8 @@ mod tests {
                 name: "dummy".into(),
                 description: "does nothing".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
 

@@ -48,6 +48,10 @@ pub struct AnthropicProvider {
     /// Explicit TTL for cache_control breakpoints ("5m" | "1h"); `None`
     /// leaves the endpoint default (5 minutes) applied.
     cache_ttl: Option<String>,
+    /// Prompt dialect for this backend instance. The same struct serves both
+    /// real Anthropic (English XML) and DeepSeek's Anthropic-compatible
+    /// endpoint (Chinese markdown), so the dialect is set at construction.
+    dialect: deepseeknova_core::PromptDialect,
 }
 
 impl AnthropicProvider {
@@ -101,7 +105,19 @@ impl AnthropicProvider {
             temperature: None,
             cache_control: true,
             cache_ttl: None,
+            dialect: deepseeknova_core::PromptDialect {
+                lang: deepseeknova_core::PromptLang::En,
+                format: deepseeknova_core::PromptFormat::Xml,
+                max_message_tokens: None,
+            },
         })
+    }
+
+    /// Override the prompt dialect (used by the deepseek-anthropic factory
+    /// path to switch to Chinese markdown).
+    pub fn with_dialect(mut self, dialect: deepseeknova_core::PromptDialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Enable DeepSeek/Anthropic extended-thinking mode.
@@ -276,11 +292,20 @@ impl AnthropicProvider {
             let schemas: Vec<_> = ts.iter().map(|t| t.schema()).collect();
             let mut built: Vec<AnthropicTool> = schemas
                 .iter()
-                .map(|s| AnthropicTool {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    input_schema: s.parameters.clone(),
-                    cache_control: None,
+                .map(|s| {
+                    // DeepSeek's Anthropic-compatible endpoint responds more
+                    // reliably to Chinese tool descriptions; real Anthropic
+                    // stays English.
+                    let s = deepseeknova_core::tool_localize::localize_tool_schema(
+                        s.clone(),
+                        self.dialect,
+                    );
+                    AnthropicTool {
+                        name: s.name,
+                        description: s.description,
+                        input_schema: s.parameters,
+                        cache_control: None,
+                    }
                 })
                 .collect();
             // Anthropic 惯例：最后一个 tool 携带 cache_control 断点，标记
@@ -376,6 +401,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn dialect(&self) -> deepseeknova_core::PromptDialect {
+        self.dialect
+    }
+
     async fn generate(
         &self,
         validated: ValidatedRequest<'_>,
@@ -1122,6 +1151,8 @@ mod tests {
                 name: "test_tool".into(),
                 description: "does nothing".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(
@@ -1793,6 +1824,8 @@ mod tests {
                     name: "noop".into(),
                     description: "does nothing".into(),
                     parameters: serde_json::json!({"type": "object"}),
+                    few_shot_examples: None,
+                    return_parameters: None,
                 }
             }
             async fn execute(

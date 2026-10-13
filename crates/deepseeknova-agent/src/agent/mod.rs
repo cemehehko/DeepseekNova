@@ -5,6 +5,7 @@ use crate::classify::{
 use crate::diagnose::{DiagnoseGuard, DiagnoseHook};
 use crate::memory::Memory;
 use crate::path::{extract_tool_path, extract_touched_paths, tool_cache_key};
+#[cfg(test)]
 use crate::prompts::DEFAULT_SYSTEM_PROMPT;
 use crate::recursion::DelegateDepth;
 use crate::render::{
@@ -527,12 +528,25 @@ impl Agent {
         self
     }
 
+    /// The effective default system prompt for this agent, selected by the
+    /// provider's `deepseeknova_core::PromptDialect` (native language + format).
+    /// When no explicit prompt was configured, this is what gets injected as
+    /// the `system` message on each run.
+    pub fn default_system_prompt(&self) -> String {
+        let dialect = self.provider.dialect();
+        crate::prompts::render_prompt_for_dialect(dialect)
+    }
+
     /// Append text to the system prompt (used to inject retrieval strategy hints).
     pub fn with_appended_system_prompt(mut self, extra: impl AsRef<str>) -> Self {
         match self.system_prompt {
             Some(ref mut s) => s.push_str(extra.as_ref()),
             None => {
-                self.system_prompt = Some(format!("{DEFAULT_SYSTEM_PROMPT}\n\n{}", extra.as_ref()))
+                self.system_prompt = Some(format!(
+                    "{}\n\n{}",
+                    self.default_system_prompt(),
+                    extra.as_ref()
+                ))
             }
         }
         self
@@ -947,6 +961,34 @@ impl Runner for Agent {
     ) -> Result<RunEventStream, deepseeknova_core::DeepseeknovaError> {
         self.run_stream_with_extensions(input, Vec::new()).await
     }
+
+    /// Expose the exact system prompt + tool schemas this agent will send to
+    /// the model, so the trace log can record the model's view verbatim.
+    fn debug_config(&self) -> deepseeknova_core::runner::RunnerDebugConfig {
+        let dialect = self.provider.dialect();
+        let mut tools: Vec<deepseeknova_core::runner::RunnerToolInfo> = self
+            .tools
+            .values()
+            .map(|t| {
+                // Record the dialect-localised schema (what the provider will
+                // actually serialise), not the raw English in-source schema.
+                let s = deepseeknova_core::tool_localize::localize_tool_schema(t.schema(), dialect);
+                deepseeknova_core::runner::RunnerToolInfo {
+                    name: s.name,
+                    description: s.description,
+                    parameters: s.parameters,
+                }
+            })
+            .collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        deepseeknova_core::runner::RunnerDebugConfig {
+            system_prompt: self
+                .system_prompt
+                .clone()
+                .or_else(|| Some(crate::prompts::render_prompt_for_dialect(dialect))),
+            tools,
+        }
+    }
 }
 
 impl Agent {
@@ -981,7 +1023,7 @@ impl Agent {
         let system_prompt = self
             .system_prompt
             .clone()
-            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+            .unwrap_or_else(|| self.default_system_prompt());
         let compaction_threshold = self.compaction_threshold_tokens;
         let turn_end_result_cap = self.turn_end_result_cap_tokens;
         let preventive_shrink_ratio = self.preventive_shrink_ratio;

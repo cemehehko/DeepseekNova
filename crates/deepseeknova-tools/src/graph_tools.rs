@@ -204,6 +204,8 @@ impl Tool for TraverseGraphTool {
                 },
                 "required": ["entity"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -320,6 +322,8 @@ impl Tool for RetrieveEntityTool {
                 },
                 "required": ["entity"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -468,6 +472,8 @@ impl Tool for TraceCodeTool {
                 },
                 "required": ["entity"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -563,6 +569,8 @@ impl Tool for ImpactCodeTool {
                 },
                 "required": ["entity"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -673,6 +681,8 @@ impl Tool for ExploreCodeTool {
                 },
                 "required": ["entities"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -833,6 +843,8 @@ impl Tool for DepsCodeTool {
                     }
                 }
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -992,6 +1004,8 @@ impl Tool for TagCodeTool {
                 },
                 "required": ["entity", "tags"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -1074,6 +1088,8 @@ impl Tool for TagStatusTool {
                 },
                 "required": ["path"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

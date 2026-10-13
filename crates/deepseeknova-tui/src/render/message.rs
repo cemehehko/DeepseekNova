@@ -1142,6 +1142,8 @@ impl AppState {
         // 记录对话区屏幕范围：事件循环左键点击据此判断是否落在对话区内
         //（审查#5：此前无条件转发，点输入框/状态栏也会折叠消息）。
         self.conv_area = Some(conv_area);
+        // 记录状态行屏幕范围（仅布局参考；点击切换见 ctx_segment_area）。
+        self.status_area = Some(status_area);
 
         // 消息块布局：无边框无角色头（Claude Code 风格），归属靠 ❯/⏺ 标记。
         // 先估算总物理高度再钳制滚动。块高度只估算一遍：既用于总行数/滚动
@@ -1259,12 +1261,24 @@ impl AppState {
         }
 
         // ── 状态行 ────────────────────────────────────────
-        let status = Paragraph::new(crate::render::status::fit_status_line(
+        let status = crate::render::status::fit_status_line_detailed(
             self,
             &theme,
             status_area.width as usize,
-        ));
-        f.render_widget(status, status_area);
+        );
+        // 记录 ctx 段（tokens/百分比文字）的屏幕范围：事件循环左键点击
+        // 仅在命中此段时切换显示单位（点状态行其他位置不切换）。
+        self.ctx_segment_area = if status_area.height > 0 {
+            status.ctx_cols.map(|(start, end)| Rect {
+                x: status_area.x + start,
+                y: status_area.y,
+                width: end.saturating_sub(start),
+                height: 1,
+            })
+        } else {
+            None
+        };
+        f.render_widget(Paragraph::new(status.line), status_area);
 
         // 临时命令反馈（状态变更类命令）：画在输入区上方，超时自动消失，
         // 不进入对话面板的永久 echo 通道。

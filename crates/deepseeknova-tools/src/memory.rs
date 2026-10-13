@@ -54,6 +54,8 @@ impl Tool for RememberTool {
                 },
                 "required": ["key", "value"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -121,6 +123,8 @@ impl Tool for ForgetTool {
                 "properties": {"key": {"type": "string", "description": "Key."}},
                 "required": ["key"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -182,6 +186,8 @@ impl Tool for RecallTool {
                 },
                 "required": ["query"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

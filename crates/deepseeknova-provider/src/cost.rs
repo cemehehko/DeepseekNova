@@ -251,6 +251,14 @@ impl MeteredProvider {
 
 #[async_trait]
 impl Provider for MeteredProvider {
+    fn dialect(&self) -> deepseeknova_core::PromptDialect {
+        self.inner.dialect()
+    }
+
+    async fn warmup(&self) -> Result<(), deepseeknova_core::DeepseeknovaError> {
+        self.inner.warmup().await
+    }
+
     async fn generate(
         &self,
         validated: ValidatedRequest<'_>,
@@ -623,5 +631,44 @@ mod tests {
         let v = crate::ValidatedRequest::new(&msgs, &[]).unwrap();
         p.generate(v).await.unwrap();
         assert_eq!(ledger.report(&PriceTable::new()).unmetered_calls, 1);
+    }
+
+    // MeteredProvider должен прокидывать warmup в обёрнутый провайдер,
+    // чтобы OAuth-диалекты (GigaChat) прогревались через роутер.
+    #[tokio::test]
+    async fn metered_provider_delegates_warmup_to_inner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct WarmupProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::Provider for WarmupProvider {
+            async fn generate(
+                &self,
+                _v: crate::ValidatedRequest<'_>,
+            ) -> Result<Message, deepseeknova_core::DeepseeknovaError> {
+                Err(deepseeknova_core::DeepseeknovaError::provider(
+                    "not used".to_string(),
+                ))
+            }
+            async fn warmup(&self) -> Result<(), deepseeknova_core::DeepseeknovaError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let p = MeteredProvider::new(
+            Arc::new(WarmupProvider {
+                calls: Arc::clone(&calls),
+            }),
+            ModelRole::Main,
+            "big",
+            Arc::new(CostLedger::new()),
+        );
+        p.warmup().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

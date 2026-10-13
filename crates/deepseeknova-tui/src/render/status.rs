@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::actions::ActionContext;
 use crate::app::focus::Focus;
-use crate::app::state::AppState;
+use crate::app::state::{AppState, CtxDisplay};
 use crate::i18n::{Key, Tr};
 use crate::theme::{SemanticTone, Theme};
 
@@ -162,13 +162,29 @@ fn tagged_segments(app: &AppState, theme: &Theme) -> Vec<(u8, Line<'static>)> {
     segments
 }
 
+/// 宽度感知的状态行 + ctx 段列区间。生产渲染走 [`fit_status_line_detailed`]
+/// 以便同时拿到 ctx 段在行内的可见列范围（点击命中测试用）；测试仍用
+/// `fit_status_line` 直接拿 [Line]。
+pub struct StatusLine {
+    pub line: Line<'static>,
+    /// ctx 段（tokens/百分比文字）在状态行内的可见列区间 `[start, end)`；
+    /// 该段因宽度不足被丢弃/截断时为 None。
+    pub ctx_cols: Option<(u16, u16)>,
+}
+
 /// 宽度感知的状态行（grok 三栏对齐）：左栏 context（工作区/模型/ctx）、
 /// 中栏 turn（回合计数 + 视图标签）、右栏 mode（运行态/权限/警示/退出）。
 ///
 /// 总宽超过 `width` 时按栏内优先级丢弃：先丢左栏 workspace → 左栏 ctx →
 /// 中栏 turn → 最后保留右栏核心（运行态 + 权限模式 + 退出警示），
 /// 仍放不下则对整行截断加省略号。参考 Codex footer 的回退链思路。
+#[cfg(test)]
 pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    fit_status_line_detailed(app, theme, width).line
+}
+
+/// `fit_status_line` 的带 ctx 列区间版本。
+pub fn fit_status_line_detailed(app: &AppState, theme: &Theme, width: usize) -> StatusLine {
     let dim = Style::default().add_modifier(Modifier::DIM);
     // ── 三栏：左 context / 中 turn / 右 mode ──────────────
     // 左栏：工作区 + 模型 + ctx 预算条（信息性，优先丢弃）。
@@ -292,7 +308,7 @@ pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'sta
     }
     let total: usize = segs.iter().map(|(_, s)| s.width()).sum();
     if total <= width.max(1) {
-        return flatten_lines(segs);
+        return flatten_all_with_ctx(segs);
     }
     // 丢弃非核心 segment（优先级低于 PRIO_MODEL 的都可丢），按优先级升序丢最次要的，
     // 直到放得下或只剩核心（运行态 + 模型 + 权限模式 + 退出警示）。
@@ -312,16 +328,21 @@ pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'sta
     // 丢弃后放得下：直接返回，不再截断/加省略号。
     let remaining: usize = segs.iter().map(|(_, s)| s.width()).sum();
     if remaining <= width.max(1) {
-        return flatten_lines(segs);
+        return flatten_all_with_ctx(segs);
     }
     // 核心仍超宽：对整行做显示宽度截断并加省略号。
     let mut line = String::new();
     let mut used = 0usize;
     let budget = width.saturating_sub(1);
-    for (_, s) in &segs {
+    let mut ctx_cols = None;
+    for (prio, s) in &segs {
         let w = s.width();
         if used + w > budget && !line.is_empty() {
             break;
+        }
+        if *prio == PRIO_CTX {
+            // 只记录整段都能放下的情况（本路径不半截显示），列区间相对行首。
+            ctx_cols = Some((used as u16, (used + w) as u16));
         }
         line.push_str(&s.to_string());
         used += w;
@@ -340,16 +361,30 @@ pub fn fit_status_line(app: &AppState, theme: &Theme, width: usize) -> Line<'sta
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
-    Line::from(spans)
+    StatusLine {
+        line: Line::from(spans),
+        ctx_cols,
+    }
 }
 
-/// 把带优先级的 segment 列表拍平为单行（丢弃优先级，合并所有 span）。
-fn flatten_lines(segs: Vec<(u8, Line<'static>)>) -> Line<'static> {
-    Line::from(
-        segs.into_iter()
-            .flat_map(|(_, line)| line.spans)
-            .collect::<Vec<_>>(),
-    )
+/// 把带优先级的 segment 列表拍平为单行（丢弃优先级，合并所有 span），
+/// 同时返回 ctx 段在行内的可见列区间（列从 0 起，半开 `[start, end)`）。
+fn flatten_all_with_ctx(segs: Vec<(u8, Line<'static>)>) -> StatusLine {
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    let mut ctx_cols = None;
+    for (prio, line) in segs {
+        let w = line.width();
+        if prio == PRIO_CTX {
+            ctx_cols = Some((col as u16, (col + w) as u16));
+        }
+        col += w;
+        spans.extend(line.spans);
+    }
+    StatusLine {
+        line: Line::from(spans),
+        ctx_cols,
+    }
 }
 
 /// 上下文感知提示行：随焦点显示当前键位。键位文本从 action 注册表
@@ -497,14 +532,15 @@ fn session_cache_segment(app: &AppState, theme: &Theme) -> Option<(u8, Line<'sta
 fn grok_ctx_segment(app: &AppState, theme: &Theme) -> Option<(u8, Line<'static>)> {
     let (used, window) = app.context_usage?;
     let pct = used.saturating_mul(100).checked_div(window).unwrap_or(0);
-    let hovered = app.mouse_pos.is_some();
-    let text = if hovered {
-        // hover：进度条（10 格）+ 5 字符百分比（grok context_bar hover 观感）。
-        let filled = (pct.min(100) * 10).div_ceil(100) as usize;
-        let bar = "█".repeat(filled) + &"░".repeat(10 - filled);
-        format!(" {bar} {}", fmt_pct5(pct))
-    } else {
-        format!(" {} / {}", fmt_tokens(used), fmt_tokens(window))
+    let text = match app.ctx_display {
+        // 百分比：进度条（10 格）+ 5 字符百分比（grok context_bar 观感）。
+        CtxDisplay::Percent => {
+            let filled = (pct.min(100) * 10).div_ceil(100) as usize;
+            let bar = "█".repeat(filled) + &"░".repeat(10 - filled);
+            format!(" {bar} {}", fmt_pct5(pct))
+        }
+        // tokens（默认）：`8.5K / 1.0M`。
+        CtxDisplay::Tokens => format!(" {} / {}", fmt_tokens(used), fmt_tokens(window)),
     };
     Some((
         PRIO_CTX,
@@ -1022,5 +1058,62 @@ mod tests {
             "极窄退化为模型+省略号: {tiny_text}"
         );
         assert!(tiny_text.width() <= 13, "宽度受约束: {tiny_text}");
+    }
+
+    #[test]
+    fn grok_ctx_segment_respects_ctx_display_mode() {
+        let theme = Theme::default();
+        // 默认 tokens 模式：`4.0K / 128K`。
+        let tokens = AppState {
+            context_usage: Some((4_000, 128_000)),
+            ctx_display: CtxDisplay::Tokens,
+            ..Default::default()
+        };
+        let (_, line) = grok_ctx_segment(&tokens, &theme).unwrap();
+        assert!(line.to_string().contains("4.0K / 128K"), "{line:?}");
+        // 百分比模式：进度条 + 百分比；无 tokens 格式。
+        let percent = AppState {
+            context_usage: Some((4_000, 128_000)),
+            ctx_display: CtxDisplay::Percent,
+            ..Default::default()
+        };
+        let (_, line) = grok_ctx_segment(&percent, &theme).unwrap();
+        let text = line.to_string();
+        assert!(text.contains('%'), "{line:?}");
+        assert!(
+            !text.contains("128K"),
+            "百分比模式不显示 token 窗口: {text}"
+        );
+    }
+
+    #[test]
+    fn fit_status_line_detailed_reports_ctx_cols_only_when_visible() {
+        let theme = Theme::default();
+        let app = AppState {
+            model_label: "deepseek".into(),
+            context_usage: Some((4_000, 128_000)),
+            ..Default::default()
+        };
+
+        // 宽行：ctx 段完整可见，列区间相对行首（0 起），内容与区间对齐。
+        let wide = fit_status_line_detailed(&app, &theme, 400);
+        let (start, end) = wide.ctx_cols.expect("宽行 ctx 段可见");
+        assert!(start < end && end <= 400, "({start}, {end})");
+        let rendered = wide.line.to_string();
+        let slice: String = rendered
+            .chars()
+            .skip(start as usize)
+            .take((end - start) as usize)
+            .collect();
+        assert_eq!(slice, " 4.0K / 128K", "列区间必须只覆盖 ctx 文字: {slice}");
+
+        // 窄行：ctx 因宽度不足被丢弃，不再提供可点击列区间。
+        let narrow = fit_status_line_detailed(&app, &theme, 20);
+        assert!(
+            narrow.ctx_cols.is_none(),
+            "窄行 ctx 段被丢弃: {:?}",
+            narrow.ctx_cols
+        );
+        assert!(!narrow.line.to_string().contains("128K"));
     }
 }

@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use deepseeknova_core::chunk::Usage;
 use deepseeknova_core::runner::RunEvent;
+use deepseeknova_provider::ProviderAuthState;
 
 use super::focus::{CompletionState, Focus, HelpOverlay, SidebarTab};
 use crate::i18n::{Key, Tr};
@@ -47,6 +48,17 @@ pub fn display_mode_label(mode: DisplayMode) -> Key {
 /// Normal/Raw 展示全部内容）。
 pub fn hides_reasoning(mode: DisplayMode) -> bool {
     matches!(mode, DisplayMode::Lite | DisplayMode::NoReasoning)
+}
+
+/// 状态行上下文占用显示单位：`used / window`（tokens）或进度条 + 百分比。
+/// 仅在显式点击状态行 ctx 段时切换（不再由鼠标 hover 驱动）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CtxDisplay {
+    /// tokens：`8.5K / 1.0M`（默认）。
+    #[default]
+    Tokens,
+    /// 百分比：`█████ 42.0%` 进度条 + 百分比。
+    Percent,
 }
 
 /// 折叠策略（`/fold auto|open|compact` 切换；auto 为智能默认）。
@@ -331,12 +343,18 @@ pub struct AppState {
     pub provider_configured: bool,
     /// 当前 provider 的 API key 可解析（内联或环境变量）。
     pub api_key_configured: bool,
+    /// 当前 provider 的启动授权状态（OAuth warm-up 进度），驱动 ⚡ 指示器。
+    /// `NotRequired` = API-key 模型（готовность = api_key_configured）。
+    pub auth_state: ProviderAuthState,
     /// 最近一次 `/scorecard` 加载的测光评分卡（侧边栏 Cost 面板展示）。
     pub scorecard: Option<crate::model::scorecard::Scorecard>,
     /// 最近一次请求的实际上下文占用 `(used_tokens, window_tokens)`，
     /// 由事件循环每帧从 `usage` + `TuiCaps.context_window` 刷新；无 router
     /// 或未配置 window 时为 None（状态行不显示占用率）。
     pub context_usage: Option<(u64, u64)>,
+    /// 状态行 ctx 段的显示单位（tokens / 百分比）。仅显式点击状态行
+    /// ctx 段时切换；hover 不再切换。
+    pub ctx_display: CtxDisplay,
     /// 临时命令反馈（如 `/fold`、`/raw` 的状态变更提示），渲染在状态行
     /// 上方，超时自动消失；不进入对话面板的永久 echo 通道。
     pub notice: Option<(String, std::time::Instant)>,
@@ -480,6 +498,12 @@ pub struct AppState {
     /// 对话区当前屏幕范围（draw 时写入；事件循环左键点击据此判断是否
     /// 落在对话区内——审查#5：此前无条件转发，点输入框/状态栏也会折叠）。
     pub conv_area: Option<ratatui::layout::Rect>,
+    /// 状态行当前屏幕范围（draw 时写入；仅作布局参考）。
+    pub status_area: Option<ratatui::layout::Rect>,
+    /// 状态行内 ctx 段（tokens/百分比那一段文字）的屏幕范围（draw 时写入）。
+    /// 事件循环左键点击仅在落在此段内时切换 ctx 显示单位，点状态行其他
+    /// 位置不切换（用户要求：必须显式点击 token 文字才切换）。
+    pub ctx_segment_area: Option<ratatui::layout::Rect>,
     /// TUI 交互 trace 日志（None = 未开启 `[trace] enabled`）。开启时事件
     /// 循环把用户/agent/工具/审批流写入 JSONL 文件供离线复盘。
     pub trace: Option<crate::trace::TraceStore>,
@@ -934,6 +958,14 @@ impl AppState {
     /// 全屏切换：隐藏状态行与提示行（Ctrl+Shift+F）。
     pub fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
+    }
+
+    /// 切换状态行 ctx 段的显示单位（tokens ↔ 百分比）。仅显式点击触发。
+    pub fn toggle_ctx_display(&mut self) {
+        self.ctx_display = match self.ctx_display {
+            CtxDisplay::Tokens => CtxDisplay::Percent,
+            CtxDisplay::Percent => CtxDisplay::Tokens,
+        };
     }
 
     /// 循环切换折叠策略（auto → open → compact → auto）。
@@ -2300,5 +2332,15 @@ mod tests {
         app.perm_mode_cycle = false;
         assert!(!app.handle_modal_shortcuts(&key(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(!app.perm_mode_cycle);
+    }
+
+    #[test]
+    fn ctx_display_toggles_between_tokens_and_percent() {
+        let mut app = AppState::default();
+        assert_eq!(app.ctx_display, CtxDisplay::Tokens);
+        app.toggle_ctx_display();
+        assert_eq!(app.ctx_display, CtxDisplay::Percent);
+        app.toggle_ctx_display();
+        assert_eq!(app.ctx_display, CtxDisplay::Tokens);
     }
 }

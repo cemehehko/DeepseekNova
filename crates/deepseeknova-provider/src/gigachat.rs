@@ -36,7 +36,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::StreamExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default OAuth token endpoint for the GigaChat API.
 const DEFAULT_OAUTH_URL: &str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
@@ -102,6 +102,11 @@ pub struct GigaChatProvider {
     temperature: Option<f32>,
     /// Upper bound on generated tokens; written into the body when set.
     max_tokens: Option<u32>,
+    /// Cap on reasoning-token generation (`reasoning_max_tokens`, V1). Set to
+    /// `Some(0)` to disable reasoning entirely (GigaChat-2-Pro then emits its
+    /// answer directly in `content`), or to a positive value to bound the
+    /// thinking chain. `None` leaves it to the model default.
+    reasoning_max_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +119,12 @@ struct GigaFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    /// Примеры «запрос → аргументы», повышающие качество выбора функции.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    few_shot_examples: Option<serde_json::Value>,
+    /// Структура результата функции (`return_parameters`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_parameters: Option<serde_json::Value>,
 }
 
 /// A single message in the GigaChat `messages` array.
@@ -125,6 +136,12 @@ struct GigaMessage {
     role: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     content: String,
+    /// Reasoning chain returned alongside `content` by reasoning-capable
+    /// models (GigaChat-2-Pro). Populated from the wire `reasoning_content`;
+    /// never serialised back (it is replayed into core `Message.reasoning_*`
+    /// rather than the GigaChat `messages` array).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +172,10 @@ struct GigaChatResponse {
 #[derive(Debug, Deserialize)]
 struct GigaChoice {
     message: GigaMessage,
+    /// Why generation stopped: `"function_call"`, `"stop"`, or `"error"`
+    /// (the model produced invalid function arguments).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Streaming chunk (SSE frame body). GigaChat streams `delta.content` like the
@@ -172,12 +193,25 @@ struct GigaStreamResponse {
 struct GigaStreamChoice {
     #[serde(default)]
     delta: GigaDelta,
+    /// Why generation stopped, set on the final frame of a choice:
+    /// `"function_call"`, `"stop"`, or `"error"`.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Incremental delta within a streaming response.
+///
+/// GigaChat sends `function_call` inline in the delta (arguments as a JSON
+/// object) when the model chooses to call a tool — in the streaming mode the
+/// whole call arrives in a single frame, not as token-deltas. Reasoning-capable
+/// models (GigaChat-2-Pro) also stream `reasoning_content` ahead of `content`.
 #[derive(Debug, Default, Deserialize)]
 struct GigaDelta {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    function_call: Option<GigaFunctionCall>,
 }
 
 /// Token usage reported by GigaChat. `precached_prompt_tokens` is the cached
@@ -303,7 +337,16 @@ impl GigaChatProvider {
             tool_cache: ToolSchemaCache::with_capacity(16),
             temperature,
             max_tokens,
+            reasoning_max_tokens: None,
         })
+    }
+
+    /// Cap reasoning-token generation for this provider. `Some(0)` disables
+    /// reasoning (GigaChat-2-Pro answers directly in `content`); a positive
+    /// value bounds the thinking chain; `None` keeps the model default.
+    pub fn with_reasoning_max_tokens(mut self, tokens: u32) -> Self {
+        self.reasoning_max_tokens = Some(tokens);
+        self
     }
 
     /// Set the sampling temperature written into every request body.
@@ -373,30 +416,120 @@ impl GigaChatProvider {
 
     /// Build the GigaChat `functions` array from the core tools, cached by tool
     /// identity. Returns `None` for an empty set (field omitted).
+    ///
+    /// GigaChat is stricter than OpenAI on parameter schemas: every
+    /// `"type": "object"` node (nested or top-level) **must** carry a
+    /// `properties` object, or the API rejects the request with 422
+    /// (`Field 'properties…' is missing`). Core tools legitimately emit
+    /// `{type: object, additionalProperties: …}` without `properties`, so we
+    /// normalise each schema by injecting an empty `properties` where absent.
     fn build_functions(&self, tools: &[&dyn Tool]) -> Option<serde_json::Value> {
         self.tool_cache.get_or_build(tools, |ts| {
             let mut schemas: Vec<_> = ts.iter().map(|t| t.schema()).collect();
             schemas.sort_by(|a, b| a.name.cmp(&b.name));
             let funcs: Vec<GigaFunction> = schemas
                 .iter()
-                .map(|s| GigaFunction {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    parameters: s.parameters.clone(),
+                .map(|s| {
+                    // GigaChat responds far more reliably to Russian tool
+                    // descriptions (Sber recommendation); localise schema
+                    // before serialisation.
+                    let localised = deepseeknova_core::tool_localize::localize_tool_schema(
+                        s.clone(),
+                        deepseeknova_core::PromptDialect {
+                            lang: deepseeknova_core::PromptLang::Ru,
+                            format: deepseeknova_core::PromptFormat::Markdown,
+                            max_message_tokens: None,
+                        },
+                    );
+                    GigaFunction {
+                        name: localised.name,
+                        description: localised.description,
+                        parameters: ensure_object_properties(localised.parameters),
+                        few_shot_examples: localised
+                            .few_shot_examples
+                            .map(|ex| serde_json::json!(ex)),
+                        return_parameters: localised.return_parameters,
+                    }
                 })
                 .collect();
             serde_json::json!(funcs)
         })
     }
 
-    /// Serialise the core `messages` into the GigaChat wire format, enforcing
-    /// the single-first-`system` invariant and mapping `Role::Tool` results to
-    /// `role: "function"`.
+    /// Serialise the core `messages` into the GigaChat wire format.
+    ///
+    /// GigaChat enforces three invariants that the core message stream does not
+    /// guarantee, so they are normalised here:
+    ///
+    /// * **At most one `system` message, and it must be first.** Any `System`
+    ///   messages are hoisted to the front (their order preserved) and merged
+    ///   into a single `system` message separated by newlines. This mirrors the
+    ///   OpenAI/Anthropic backends, which split the system prompt out of the
+    ///   conversation.
+    /// * **`Role::Tool` results map to `role: "function"`** (see
+    ///   [`Self::map_message`]).
+    /// * **No orphan `function` result.** GigaChat rejects (422) any
+    ///   `role: "function"` result that is not paired with a preceding
+    ///   `assistant.function_call` of the same name —
+    ///   `every assistant function result must have an assistant function call
+    ///   in history`. The core stream can contain such orphans after history
+    ///   compaction evicts an assistant call but keeps its result. We track the
+    ///   function calls emitted by assistant messages (one per message — see
+    ///   [`Self::map_message`]) and drop tool results whose name has no
+    ///   outstanding match.
     fn build_messages(&self, messages: &[Message]) -> Vec<GigaMessage> {
-        messages
+        let system_text: String = messages
             .iter()
-            .map(|m| self.map_message(messages, m))
-            .collect()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut out: Vec<GigaMessage> = Vec::with_capacity(messages.len() + 1);
+        if !system_text.is_empty() {
+            out.push(GigaMessage {
+                role: "system".to_string(),
+                content: system_text,
+                reasoning_content: None,
+                name: None,
+                function_call: None,
+                functions_state_id: None,
+            });
+        }
+        // Names of assistant `function_call`s not yet consumed by a result.
+        // Each `Role::Tool` result consumes one matching outstanding call;
+        // results with no matching call are orphans and dropped (else 422).
+        let mut pending_calls: Vec<String> = Vec::new();
+        for m in messages.iter().filter(|m| m.role != Role::System) {
+            match m.role {
+                Role::Assistant => {
+                    // map_message emits only the first tool call per assistant,
+                    // so only its name is tracked as an outstanding call.
+                    if let Some(first) = m.tool_calls.as_ref().and_then(|tcs| tcs.first()) {
+                        pending_calls.push(first.function.name.clone());
+                    }
+                    out.push(self.map_message(messages, m));
+                }
+                Role::Tool => {
+                    let name = m
+                        .name
+                        .clone()
+                        .or_else(|| resolve_tool_name(messages, m.tool_call_id.as_deref()))
+                        .unwrap_or_default();
+                    if let Some(pos) = pending_calls.iter().position(|n| *n == name) {
+                        pending_calls.remove(pos);
+                        out.push(self.map_message(messages, m));
+                    } else {
+                        warn!(
+                            tool = %name,
+                            "dropping orphan GigaChat tool result (no paired assistant \
+                             function_call); would otherwise be rejected with 422"
+                        );
+                    }
+                }
+                _ => out.push(self.map_message(messages, m)),
+            }
+        }
+        out
     }
 
     /// Map a single core [`Message`] to its GigaChat representation.
@@ -414,6 +547,7 @@ impl GigaChatProvider {
             Role::System => GigaMessage {
                 role: "system".to_string(),
                 content: m.content.clone(),
+                reasoning_content: None,
                 name: None,
                 function_call: None,
                 functions_state_id: None,
@@ -421,6 +555,7 @@ impl GigaChatProvider {
             Role::User => GigaMessage {
                 role: "user".to_string(),
                 content: m.content.clone(),
+                reasoning_content: None,
                 name: None,
                 function_call: None,
                 functions_state_id: None,
@@ -442,6 +577,7 @@ impl GigaChatProvider {
                 GigaMessage {
                     role: "assistant".to_string(),
                     content: m.content.clone(),
+                    reasoning_content: None,
                     name: None,
                     function_call,
                     functions_state_id: None,
@@ -453,9 +589,16 @@ impl GigaChatProvider {
                     .clone()
                     .or_else(|| resolve_tool_name(all, m.tool_call_id.as_deref()))
                     .unwrap_or_default();
+                // GigaChat requires the `function` result `content` to be a
+                // valid JSON string (raw/text tool output is rejected with 422
+                // `invalid function result json string`). Wrap the tool output
+                // in a JSON object as a single value, matching the wire format
+                // the API documents for `role: "function"` results.
+                let result = giga_function_result(&m.content);
                 GigaMessage {
                     role: "function".to_string(),
-                    content: m.content.clone(),
+                    content: result,
+                    reasoning_content: None,
                     name: Some(name),
                     function_call: None,
                     functions_state_id: None,
@@ -490,6 +633,9 @@ impl GigaChatProvider {
         }
         if let Some(mt) = self.max_tokens {
             req["max_tokens"] = serde_json::json!(mt);
+        }
+        if let Some(rmt) = self.reasoning_max_tokens {
+            req["reasoning_max_tokens"] = serde_json::json!(rmt);
         }
         req
     }
@@ -564,6 +710,31 @@ impl GigaChatProvider {
             },
         }
     }
+
+    /// [`Self::send_request`], answering a `413 Tokens limit exceeded` by
+    /// shrinking the largest function result in `body` and resending.
+    async fn send_shrinking(
+        &self,
+        body: &mut serde_json::Value,
+    ) -> Result<reqwest::Response, DeepseeknovaError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.send_request(body).await {
+                Err(e) if attempt < MAX_SHRINK_RETRIES => {
+                    let Some((actual, max)) = parse_token_limit_error(&e) else {
+                        return Err(e);
+                    };
+                    // 0.85 margin: the server's count is not linear in length.
+                    let ratio = (max as f64 / actual.max(1) as f64) * 0.85;
+                    if !shrink_largest_function_result(body, ratio) {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
 }
 
 /// Resolve the function name paired with a tool result, by locating the
@@ -579,16 +750,139 @@ fn resolve_tool_name(messages: &[Message], tool_call_id: Option<&str>) -> Option
     })
 }
 
+/// Recursively ensure every `"type": "object"` node in a JSON Schema carries a
+/// `properties` object, injecting `{}` where absent.
+///
+/// GigaChat rejects (422) any object-typed parameter whose `properties` field
+/// is missing — including nodes that only declare `additionalProperties`, which
+/// OpenAI accepts. This normalisation makes schemas emitted by core tools
+/// (`delegate.inputs`, `recursion.inputs`) wire-compatible without touching
+/// the tool contracts themselves.
+fn ensure_object_properties(schema: serde_json::Value) -> serde_json::Value {
+    fn walk(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(mut map) => {
+                let is_object_type = map.get("type").and_then(|t| t.as_str()) == Some("object");
+                if is_object_type && !map.contains_key("properties") {
+                    map.insert(
+                        "properties".to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+                let mut next = serde_json::Map::new();
+                for (k, val) in map {
+                    next.insert(k, walk(val));
+                }
+                serde_json::Value::Object(next)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(walk).collect())
+            }
+            other => other,
+        }
+    }
+    walk(schema)
+}
+
+/// How many times a `413 Tokens limit exceeded` is answered by shrinking the
+/// largest function result and resending.
+const MAX_SHRINK_RETRIES: u32 = 3;
+
+/// Parse GigaChat's `Tokens limit exceeded for index N: X (max M)` into
+/// `(X, M)`.
+///
+/// The check is opaque and not tied to `/tokens/count`: measured, it fires on
+/// CJK-heavy function results (5200 Chinese chars → 6414 "tokens") while
+/// 6400-token Russian/English results pass, so the server-reported numbers
+/// are the only reliable sizing signal.
+fn parse_token_limit_error(err: &DeepseeknovaError) -> Option<(usize, usize)> {
+    let text = err.to_string();
+    let rest = text.split("Tokens limit exceeded for index").nth(1)?;
+    let (_, rest) = rest.split_once(':')?;
+    let (actual, rest) = rest.trim_start().split_once(' ')?;
+    let max = rest.trim_start().strip_prefix("(max ")?.split(')').next()?;
+    Some((actual.parse().ok()?, max.parse().ok()?))
+}
+
+/// Truncate the largest `role: "function"` message in a request body to
+/// `ratio` of its characters, keeping `content` a valid JSON string. Returns
+/// `false` when there is no function result to shrink.
+fn shrink_largest_function_result(body: &mut serde_json::Value, ratio: f64) -> bool {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let Some(target) = msgs
+        .iter_mut()
+        .filter(|m| m["role"] == "function")
+        .max_by_key(|m| m["content"].as_str().map_or(0, |s| s.chars().count()))
+    else {
+        return false;
+    };
+    let content = target["content"].as_str().unwrap_or_default().to_string();
+    let inner = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(o)) if o.len() == 1 && o["result"].is_string() => {
+            o["result"].as_str().unwrap_or_default().to_string()
+        }
+        _ => content,
+    };
+    let total = inner.chars().count();
+    let keep = ((total as f64) * ratio) as usize;
+    if keep >= total {
+        return false;
+    }
+    let cut: String = inner.chars().take(keep).collect();
+    warn!(
+        kept_chars = keep,
+        total_chars = total,
+        "shrinking GigaChat function result after 413 token-limit rejection"
+    );
+    let marked = format!(
+        "{cut}\n…[вывод обрезан: показано {keep} из {total} символов — лимит GigaChat на результат функции; запроси нужный фрагмент точнее]"
+    );
+    target["content"] =
+        serde_json::Value::String(serde_json::json!({ "result": marked }).to_string());
+    true
+}
+
+/// Serialise a tool result into the JSON string GigaChat expects on a
+/// `role: "function"` message. The API rejects (422) non-JSON `content`, so
+/// the raw tool output is wrapped as `{"result": "<output>"}`. If the tool
+/// output already parses as a JSON object/array, it is passed through verbatim
+/// (the model receives the tool's structured result unchanged).
+fn giga_function_result(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => trimmed.to_string(),
+        Ok(_) | Err(_) => serde_json::json!({ "result": raw }).to_string(),
+    }
+}
+
 #[async_trait]
 impl Provider for GigaChatProvider {
+    fn dialect(&self) -> deepseeknova_core::PromptDialect {
+        deepseeknova_core::PromptDialect {
+            lang: deepseeknova_core::PromptLang::Ru,
+            format: deepseeknova_core::PromptFormat::Markdown,
+            max_message_tokens: None,
+        }
+    }
+
+    /// Eagerly perform the OAuth client-credentials exchange and cache the
+    /// access token, so a bad credential surfaces at startup (the ⚡ indicator
+    /// stays dark until this succeeds) instead of on the first chat message.
+    async fn warmup(&self) -> Result<(), DeepseeknovaError> {
+        self.access_token().await?;
+        Ok(())
+    }
+
     async fn generate(
         &self,
         validated: ValidatedRequest<'_>,
     ) -> Result<Message, DeepseeknovaError> {
         let messages = validated.messages;
         let tools = validated.tools;
-        let body = self.build_request(messages, tools, false);
-        let response = self.send_request(&body).await?;
+        let mut body = self.build_request(messages, tools, false);
+        let response = self.send_shrinking(&mut body).await?;
 
         let resp_body: GigaChatResponse = response.json().await.map_err(|e| {
             DeepseeknovaError::provider(format!("failed to parse GigaChat response: {e}"))
@@ -612,6 +906,19 @@ impl Provider for GigaChatProvider {
             .next()
             .ok_or(ProviderError::NoChoices)?;
 
+        if choice.finish_reason.as_deref() == Some("error") {
+            return Err(DeepseeknovaError::provider(format!(
+                "GigaChat returned finish_reason=error (invalid function arguments): {content:?}",
+                content = choice.message.content
+            )));
+        }
+        if let Some(reason) = choice.finish_reason.as_deref() {
+            debug!(
+                finish_reason = reason,
+                "gigachat non-streaming finish_reason"
+            );
+        }
+
         let mut tool_calls: Vec<deepseeknova_core::types::ToolCall> = Vec::new();
         if let Some(fc) = choice.message.function_call {
             tool_calls.push(deepseeknova_core::types::ToolCall {
@@ -634,7 +941,7 @@ impl Provider for GigaChatProvider {
                 Some(tool_calls)
             },
             tool_call_id: None,
-            reasoning_content: None,
+            reasoning_content: choice.message.reasoning_content,
             reasoning_signature: None,
             usage: resp_body.usage.as_ref().map(|u| u.to_usage()),
         })
@@ -646,11 +953,11 @@ impl Provider for GigaChatProvider {
     ) -> Result<ChunkStream, DeepseeknovaError> {
         let messages = validated.messages;
         let tools = validated.tools;
-        let body = self.build_request(messages, tools, true);
+        let mut body = self.build_request(messages, tools, true);
 
         let mut attempt = 0u32;
         loop {
-            let response = self.send_request(&body).await?;
+            let response = self.send_shrinking(&mut body).await?;
 
             let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(64);
 
@@ -763,10 +1070,61 @@ async fn process_sse_line(
     }
 
     for choice in resp.choices {
+        // `finish_reason: "error"` means the model produced invalid function
+        // arguments; surface it as a fatal provider error rather than letting
+        // the agent proceed with a blank (or bogus) tool call.
+        if choice.finish_reason.as_deref() == Some("error") {
+            let _ = tx
+                .send(Err(DeepseeknovaError::provider(
+                    "GigaChat streaming finish_reason=error (invalid function arguments)"
+                        .to_string(),
+                )))
+                .await;
+            continue;
+        }
+        if let Some(reason) = choice.finish_reason.as_deref() {
+            debug!(finish_reason = reason, "gigachat streaming finish_reason");
+        }
+        // Reasoning chain arrives before the visible content for reasoning
+        // models (GigaChat-2-Pro); emit it so the agent can surface it instead
+        // of a blank answer when the model puts everything into reasoning.
+        if let Some(ref reasoning) = choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                let _ = tx
+                    .send(Ok(Chunk::ReasoningDelta {
+                        text: reasoning.clone(),
+                        signature: None,
+                    }))
+                    .await;
+            }
+        }
         if let Some(ref content) = choice.delta.content {
             if !content.is_empty() {
                 let _ = tx.send(Ok(Chunk::TextDelta(content.clone()))).await;
             }
+        }
+        // GigaChat streams a function call as a single inline delta (arguments
+        // already a JSON object) — emit Start + End so the agent receives a
+        // complete tool call. The id is synthesized (GigaChat does not return
+        // a tool-call id; `functions_state_id` is a separate session shortcut,
+        // not a call identity).
+        if let Some(fc) = choice.delta.function_call {
+            let id = format!("call_{}", uuid::Uuid::new_v4());
+            let name = fc.name;
+            let arguments = fc.arguments.to_string();
+            let _ = tx
+                .send(Ok(Chunk::ToolCallStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(Chunk::ToolCallEnd {
+                    id,
+                    name,
+                    arguments,
+                }))
+                .await;
         }
     }
 
@@ -793,6 +1151,8 @@ mod tests {
                 name: "noop".into(),
                 description: "does nothing".into(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
 
@@ -803,6 +1163,56 @@ mod tests {
         ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
             Ok("ok".into())
         }
+    }
+
+    #[allow(dead_code)]
+    struct FewShotTool;
+
+    #[async_trait]
+    impl Tool for FewShotTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "fewshot".into(),
+                description: "does something".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: Some(vec![deepseeknova_core::types::FewShotExample {
+                    request: "открой файл foo.txt".into(),
+                    params: serde_json::json!({"path": "foo.txt"}),
+                }]),
+                return_parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"contents": {"type": "string"}}
+                })),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _args: &str,
+        ) -> Result<String, deepseeknova_core::DeepseeknovaError> {
+            Ok("ok".into())
+        }
+    }
+
+    #[test]
+    fn functions_array_serialises_few_shot_examples_and_return_parameters() {
+        let p = provider();
+        let tool = FewShotTool;
+        let tools: [&dyn Tool; 1] = [&tool];
+        let body = p.build_request(&[msg(Role::User, "hi")], &tools, false);
+        let funcs = body["functions"].as_array().unwrap();
+        assert_eq!(funcs.len(), 1);
+        let f = &funcs[0];
+        assert!(f.get("few_shot_examples").is_some());
+        let fse = f["few_shot_examples"].as_array().unwrap();
+        assert_eq!(fse[0]["request"], "открой файл foo.txt");
+        assert_eq!(fse[0]["params"]["path"], "foo.txt");
+        assert!(f.get("return_parameters").is_some());
+        assert_eq!(
+            f["return_parameters"]["properties"]["contents"]["type"],
+            "string"
+        );
     }
 
     fn provider() -> GigaChatProvider {
@@ -847,6 +1257,30 @@ mod tests {
     }
 
     #[test]
+    fn system_messages_hoisted_and_merged_into_one_first() {
+        let p = provider();
+        // Multiple System messages, none first in the core stream.
+        let msgs = [
+            msg(Role::User, "q1"),
+            msg(Role::System, "s1"),
+            msg(Role::User, "q2"),
+            msg(Role::System, "s2"),
+        ];
+        let body = p.build_request(&msgs, &[], false);
+        let arr = body["messages"].as_array().unwrap();
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "s1\ns2", "systems merged, order kept");
+        // Only one system message remains.
+        let system_count = arr.iter().filter(|m| m["role"] == "system").count();
+        assert_eq!(system_count, 1);
+        // Non-system messages follow in order.
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[1]["content"], "q1");
+        assert_eq!(arr[2]["role"], "user");
+        assert_eq!(arr[2]["content"], "q2");
+    }
+
+    #[test]
     fn tool_result_maps_to_function_role_with_name() {
         let p = provider();
         let assistant = Message {
@@ -881,7 +1315,107 @@ mod tests {
         let fn_msg = &arr[1];
         assert_eq!(fn_msg["role"], "function");
         assert_eq!(fn_msg["name"], "calc");
-        assert_eq!(fn_msg["content"], "12");
+        // GigaChat requires JSON content: the raw "12" is wrapped as an object.
+        assert_eq!(fn_msg["content"], "{\"result\":\"12\"}");
+    }
+
+    #[test]
+    fn paired_function_result_is_kept_and_orphan_is_dropped() {
+        let p = provider();
+        let assistant_with_call = |name: &str| Message {
+            role: Role::Assistant,
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![deepseeknova_core::types::ToolCall {
+                id: format!("call_{name}"),
+                ty: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+        let tool_result = |id: &str, name: &str, content: &str| Message {
+            role: Role::Tool,
+            content: content.to_string(),
+            name: Some(name.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+            reasoning_signature: None,
+            usage: None,
+        };
+
+        // Paired exchange (calc call → calc result) survives; an orphan
+        // result (grep) with no preceding function_call is dropped.
+        let msgs = [
+            msg(Role::User, "go"),
+            assistant_with_call("calc"),
+            tool_result("call_calc", "calc", "42"),
+            tool_result("call_orphan", "grep", "…orphan matches…"),
+        ];
+        let arr = p.build_messages(&msgs).clone();
+        let roles: Vec<&str> = arr.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "function"]);
+        assert_eq!(arr[2].name.as_deref(), Some("calc"));
+
+        // No tool result at all → only user + assistant survive.
+        let arr2 = p.build_messages(&[
+            msg(Role::User, "go"),
+            tool_result("call_orphan", "grep", "…orphan…"),
+        ]);
+        let roles2: Vec<&str> = arr2.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles2, vec!["user"], "orphan-only history drops the result");
+    }
+
+    #[test]
+    fn giga_function_result_wraps_and_passes_through() {
+        // Raw text → wrapped.
+        assert_eq!(giga_function_result("12"), "{\"result\":\"12\"}");
+        assert_eq!(
+            giga_function_result("# Skill\n\nsome markdown"),
+            "{\"result\":\"# Skill\\n\\nsome markdown\"}"
+        );
+        // Structured JSON object → passed through verbatim.
+        assert_eq!(giga_function_result("{\"a\":1}"), "{\"a\":1}");
+        // JSON array → passed through verbatim.
+        assert_eq!(giga_function_result("[1,2,3]"), "[1,2,3]");
+    }
+
+    #[test]
+    fn parses_token_limit_error() {
+        let e = DeepseeknovaError::provider(
+            "HTTP 413: {\"status\":413,\"message\":\"Tokens limit exceeded for index 0: 4947 (max 4096)\"}",
+        );
+        assert_eq!(parse_token_limit_error(&e), Some((4947, 4096)));
+        let other = DeepseeknovaError::provider("HTTP 500: boom");
+        assert_eq!(parse_token_limit_error(&other), None);
+    }
+
+    #[test]
+    fn shrinks_only_the_largest_function_result() {
+        let big = giga_function_result(&"汉".repeat(1_000));
+        let small = giga_function_result("ok");
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "x"},
+            {"role": "function", "name": "a", "content": small},
+            {"role": "function", "name": "b", "content": big},
+        ]});
+        assert!(shrink_largest_function_result(&mut body, 0.5));
+        assert_eq!(body["messages"][1]["content"], small);
+        let shrunk: serde_json::Value =
+            serde_json::from_str(body["messages"][2]["content"].as_str().unwrap())
+                .expect("content stays valid JSON");
+        let text = shrunk["result"].as_str().unwrap();
+        assert_eq!(text.chars().filter(|c| *c == '汉').count(), 500);
+        assert!(text.contains("вывод обрезан"));
+
+        let mut no_fn = serde_json::json!({"messages": [{"role": "user", "content": "x"}]});
+        assert!(!shrink_largest_function_result(&mut no_fn, 0.5));
     }
 
     #[test]
@@ -905,6 +1439,54 @@ mod tests {
         let body = p.build_request(&[msg(Role::User, "hi")], &[], false);
         assert!(body.get("functions").is_none());
         assert!(body.get("function_call").is_none());
+    }
+
+    #[test]
+    fn reasoning_max_tokens_is_emitted_only_when_configured() {
+        let p = provider();
+        let base = p.build_request(&[msg(Role::User, "hi")], &[], false);
+        assert!(
+            base.get("reasoning_max_tokens").is_none(),
+            "unset reasoning cap must be absent from the body"
+        );
+
+        let capped =
+            p.with_reasoning_max_tokens(0)
+                .build_request(&[msg(Role::User, "hi")], &[], false);
+        assert_eq!(capped["reasoning_max_tokens"], 0);
+        assert_eq!(capped["model"], "GigaChat-Pro-preview");
+    }
+
+    #[test]
+    fn ensure_object_properties_injects_missing_properties() {
+        // Top-level object with `additionalProperties` but no `properties`.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "inputs": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        });
+        let out = ensure_object_properties(schema);
+        let inputs = &out["properties"]["inputs"];
+        assert!(
+            inputs.get("properties").is_some(),
+            "nested object gets properties"
+        );
+        assert!(inputs["properties"].is_object());
+        assert!(
+            inputs["properties"].as_object().unwrap().is_empty(),
+            "injected properties is empty"
+        );
+        // Leaves existing properties untouched.
+        let with_props = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}}
+        });
+        let out2 = ensure_object_properties(with_props);
+        assert_eq!(out2["properties"]["x"]["type"], "string");
     }
 
     #[test]
@@ -983,5 +1565,292 @@ mod tests {
         assert_eq!(usage.cache_miss_tokens, 100);
         assert!(chunks.iter().any(|c| matches!(c, Chunk::Done)));
         assert!(done_sent);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_reasoning_content_as_reasoning_delta() {
+        // GigaChat-2-Pro streams `reasoning_content` ahead of the visible
+        // `content`; it must surface as Chunk::ReasoningDelta, not be dropped
+        // (which would leave a blank answer when content is empty).
+        let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(64);
+        let mut done_sent = false;
+        process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"рассуждение...\"}}]}",
+            &tx,
+            &mut done_sent,
+        )
+        .await
+        .unwrap();
+        process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Ответ\"}}]}",
+            &tx,
+            &mut done_sent,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c.unwrap());
+        }
+        assert!(
+            chunks.iter().any(|c| matches!(
+                c,
+                Chunk::ReasoningDelta { text, .. } if text == "рассуждение..."
+            )),
+            "reasoning_content must emit a ReasoningDelta"
+        );
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, Chunk::TextDelta(t) if t == "Ответ")));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_function_call() {
+        // GigaChat streams a function call as one inline delta with `arguments`
+        // as a JSON object — must emit a complete ToolCallStart + ToolCallEnd.
+        let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(64);
+        let mut done_sent = false;
+        process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"weather\",\"arguments\":{\"city\":\"Москва\"}}}}]}",
+            &tx,
+            &mut done_sent,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c.unwrap());
+        }
+        let start = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::ToolCallStart { id, name } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .expect("ToolCallStart present");
+        assert_eq!(start.1, "weather");
+        let end = chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::ToolCallEnd {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.clone(), name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .expect("ToolCallEnd present");
+        assert_eq!(end.0, start.0, "start/end share synthesized id");
+        assert_eq!(end.1, "weather");
+        assert_eq!(end.2, "{\"city\":\"Москва\"}");
+        // No text delta for the empty content.
+        assert!(!chunks.iter().any(|c| matches!(c, Chunk::TextDelta(_))));
+    }
+
+    /// A minimal OAuth endpoint that answers the client-credentials exchange
+    /// with a `access_token`/`expires_at` body, so `warmup()` can be tested
+    /// without reaching Sber. Returns `(oauth_url, request_count_receiver)`.
+    fn serve_oauth() -> (String, std::sync::mpsc::Receiver<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(());
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+                + 30_000;
+            let body = format!("{{\"access_token\":\"tok-123\",\"expires_at\":{expires}}}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// A minimal non-streaming chat-completions endpoint that answers exactly
+    /// one `POST /chat/completions` with the given JSON `body`, so
+    /// `generate()` can be exercised without reaching Sber. Returns the
+    /// `(base_url, request_count_receiver)` pair usable as the provider
+    /// `base_url`.
+    fn serve_chat(body: String) -> (String, std::sync::mpsc::Receiver<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn warmup_exchanges_oauth_token_and_caches_it() {
+        let (oauth_url, rx) = serve_oauth();
+        let p = GigaChatProvider::new(
+            Some("https://gigachat.example/api/v1"),
+            "GigaChat-2-Max",
+            Some(oauth_url),
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            None,
+            Some("session-abc".to_string()),
+            Some("rq-uid-123".to_string()),
+            30,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        p.warmup().await.unwrap();
+        // OAuth был выполнен ровно один раз.
+        assert!(rx.recv().is_ok(), "oauth endpoint must be hit");
+        // Токен закэширован: повторный warmup не должен снова ходить в OAuth.
+        p.warmup().await.unwrap();
+        assert!(rx.try_recv().is_err(), "second warmup must hit the cache");
+    }
+
+    #[tokio::test]
+    async fn warmup_surfaces_oauth_failure() {
+        // Не существующий endpoint → OAuth request fails → warmup returns Err.
+        let p = GigaChatProvider::new(
+            Some("https://gigachat.example/api/v1"),
+            "GigaChat-2-Max",
+            Some("http://127.0.0.1:1/api/v2/oauth".to_string()),
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            None,
+            None,
+            None,
+            2,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(p.warmup().await.is_err());
+    }
+
+    /// Build a provider whose `base_url`/`oauth_url` point at local mock
+    /// endpoints, ready for a single `generate()` call.
+    fn provider_for_generate(base_url: &str, oauth_url: &str) -> GigaChatProvider {
+        GigaChatProvider::new(
+            Some(base_url),
+            "GigaChat-2-Max",
+            Some(oauth_url.to_string()),
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            None,
+            Some("session-abc".to_string()),
+            Some("rq-uid-123".to_string()),
+            30,
+            0,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn generate_surfaces_finish_reason_error() {
+        // finish_reason=error → generate must return a fatal provider error
+        // mentioning finish_reason, not an empty Ok message.
+        let (chat_url, _) = serve_chat(
+            r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"error"}],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5,"precached_prompt_tokens":0}}"#.to_string(),
+        );
+        let (oauth_url, _) = serve_oauth();
+        let p = provider_for_generate(&chat_url, &oauth_url);
+        let msgs = [msg(Role::User, "hi")];
+        let tools: [&dyn Tool; 0] = [];
+        let validated = ValidatedRequest::new(&msgs, &tools).unwrap();
+        let err = p.generate(validated).await.unwrap_err();
+        assert!(
+            err.to_string().contains("finish_reason=error"),
+            "expected finish_reason=error in message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_accepts_finish_reason_stop() {
+        // finish_reason=stop → normal path, produce an Ok assistant message.
+        let (chat_url, _) = serve_chat(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"precached_prompt_tokens":0}}"#.to_string(),
+        );
+        let (oauth_url, _) = serve_oauth();
+        let p = provider_for_generate(&chat_url, &oauth_url);
+        let msgs = [msg(Role::User, "hi")];
+        let tools: [&dyn Tool; 0] = [];
+        let validated = ValidatedRequest::new(&msgs, &tools).unwrap();
+        let m = p.generate(validated).await.unwrap();
+        assert_eq!(m.content, "hi there");
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_finish_reason_error() {
+        // A streaming frame carrying finish_reason=error must yield an Err
+        // into the channel, and must not emit a bogus ToolCallStart/End.
+        let (tx, mut rx) = mpsc::channel::<Result<Chunk, DeepseeknovaError>>(64);
+        let mut done_sent = false;
+        process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"weather\",\"arguments\":{\"city\":\"x\"}}},\"finish_reason\":\"error\"}]}",
+            &tx,
+            &mut done_sent,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c);
+        }
+        // Exactly one Err event, no tool-call or text chunks.
+        assert_eq!(chunks.len(), 1, "expected exactly one error event");
+        let err = chunks.pop().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("finish_reason=error"),
+            "got: {err}"
+        );
     }
 }

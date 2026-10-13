@@ -216,6 +216,32 @@ where
     // Build initial agent via the factory.
     let mut runner = agent_factory(Some(current_effort), current_model.clone())?;
 
+    // 启动授权 warm-up：OAuth-провайдер (gigachat) → 后台换取 токен，成功
+    // 后打印 `⚡ {model}`；失败打印原因。API-key 模型 — ничего не делаем.
+    if let Some(r) = router.as_ref() {
+        if r.is_oauth(current_model.as_deref()) {
+            let router = Arc::clone(r);
+            let model = current_model.clone();
+            tokio::spawn(async move {
+                match router
+                    .warmup(
+                        deepseeknova_provider::cost::ModelRole::Main,
+                        model.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let label = model.unwrap_or_else(|| "default".to_string());
+                        println!("⚡ {label}");
+                    }
+                    Err(e) => {
+                        eprintln!("authorization failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
     loop {
         // Prompt
         let mode_indicator = match mode {

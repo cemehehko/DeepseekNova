@@ -333,6 +333,8 @@ mod tests {
                 name: self.0.to_string(),
                 description: "gate stub".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(

@@ -960,6 +960,8 @@ mod tests {
                 name: self.name.to_string(),
                 description: "stub".to_string(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(

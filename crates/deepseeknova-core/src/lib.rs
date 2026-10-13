@@ -57,6 +57,8 @@ pub mod graph;
 pub mod memory;
 /// 计划器：Planner trait 及其实现。
 pub mod planner;
+/// prompt 方言元数据：原生语言 + 组织格式（按 provider kind 派生）。
+pub mod prompt_dialect;
 /// 协议层：阶段门控 PhaseGate。
 pub mod protocol;
 /// 注册表中心：RegistryHub 统一管理 tools/providers/planners/skills/commands。
@@ -69,6 +71,8 @@ pub mod tokens;
 pub mod tool;
 /// 质量钩子：QualityFinding / FindingSeverity / ToolHook trait。
 pub mod tool_hook;
+/// 工具描述/参数按 prompt 方言本地化（GigaChat 需俄语、DeepSeek 需中文）。
+pub mod tool_localize;
 /// 基础类型：Message / Role / ToolCall / FunctionCall。
 pub mod types;
 
@@ -76,9 +80,11 @@ pub use chunk::*;
 pub use error::*;
 pub use execution::*;
 pub use graph::*;
+pub use prompt_dialect::*;
 pub use protocol::*;
 pub use registry::*;
 pub use runner::*;
 pub use tool::*;
 pub use tool_hook::*;
+pub use tool_localize::localize_tool_schema;
 pub use types::*;

@@ -257,6 +257,8 @@ impl Tool for SkillTool {
                 "properties": {},
                 "required": []
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

@@ -139,6 +139,13 @@ pub enum TraceEvent {
         model: String,
         /// UI language code.
         lang: String,
+        /// The system prompt the runner will inject, if any (recorded verbatim
+        /// so a future session can reproduce the exact model view).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        /// The tool schemas the runner exposes (dialect-localised).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<deepseeknova_core::runner::RunnerToolInfo>,
     },
     /// The user submitted a prompt (not a slash command).
     UserSubmit {
@@ -394,6 +401,8 @@ mod tests {
                 dir: "/ws".into(),
                 model: "m".into(),
                 lang: "en".into(),
+                system_prompt: Some("# contract".into()),
+                tools: vec![],
             },
             TraceEvent::UserSubmit {
                 ts: 1,

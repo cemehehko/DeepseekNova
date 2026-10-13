@@ -39,6 +39,8 @@ pub mod router;
 /// 共享 SSE（Server-Sent Events）行切分，OpenAI 兼容与 Anthropic 端点
 /// 流式解析共用的字节级帧切分。
 pub mod sse;
+/// Извлечение tool-вызовов из текстового ответа chat-моделей.
+pub mod text_tools;
 pub mod tool_cache;
 /// Owned wire request/response types shared by the provider backends.
 pub mod types;
@@ -243,6 +245,16 @@ impl From<ProviderError> for deepseeknova_core::DeepseeknovaError {
 /// DeepSeek V4 replay invariant is enforced by construction.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// The prompt dialect (native language + organisation format) this backend
+    /// should be fed. Callers use this to pick a localised system prompt and to
+    /// adapt tool schemas before serialisation.
+    ///
+    /// Defaults to English markdown. Dialect-specific providers (GigaChat,
+    /// Anthropic, DeepSeek) override it.
+    fn dialect(&self) -> deepseeknova_core::PromptDialect {
+        deepseeknova_core::PromptDialect::EN
+    }
+
     /// Non-streaming generate — returns a complete Message.
     /// Accepts only a [`ValidatedRequest`] whose messages have already
     /// passed the DeepSeek V4 replay invariant check.
@@ -266,6 +278,32 @@ pub trait Provider: Send + Sync {
             vec![Ok(Chunk::TextDelta(msg.content)), Ok(Chunk::Done)];
         Ok(Box::pin(tokio_stream::iter(chunks)))
     }
+
+    /// Opportunistic startup warm-up / eager validation. The default is a
+    /// no-op, which is correct for API-key backends (the key is only a static
+    /// credential, no network exchange exists to pre-flight). OAuth backends
+    /// ([`crate::gigachat::GigaChatProvider`]) override this to perform the
+    /// token exchange eagerly, so a bad credential surfaces at startup rather
+    /// than on the first user message.
+    async fn warmup(&self) -> Result<(), deepseeknova_core::DeepseeknovaError> {
+        Ok(())
+    }
+}
+
+/// Startup authorisation state for a provider, used to drive the UI readiness
+/// indicator (the ⚡ marker). Kept independent of the [`Provider`] instance so
+/// the warm-up can run in the background and be observed by the render loop.
+#[derive(Debug, Clone, Default)]
+pub enum ProviderAuthState {
+    /// Not an OAuth provider; readiness is simply presence of an API key.
+    #[default]
+    NotRequired,
+    /// Background OAuth warm-up is still in flight.
+    Warming,
+    /// Warm-up completed; the token is cached and requests can proceed.
+    Ready,
+    /// Warm-up failed; carries a human-readable reason.
+    Failed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -383,9 +421,10 @@ pub mod factory {
             "deepseek-anthropic" => Box::new(build_deepseek_anthropic(cfg, temperature, effort)?),
             // Sber GigaChat API. OAuth client-credentials auth, native
             // `functions` tool calling and `X-Session-ID` context caching.
-            // reasoning_effort / thinking are DeepSeek-specific and are not
-            // translated into the GigaChat request body.
-            "gigachat" => Box::new(build_gigachat(cfg, temperature)?),
+            // reasoning_effort is translated into `reasoning_max_tokens`:
+            // Disabled → 0 (GigaChat-2-Pro answers directly in `content`);
+            // High/Max → unset (model default thinking chain).
+            "gigachat" => Box::new(build_gigachat(cfg, temperature, effort)?),
             "ollama" | "local" => {
                 let mut p = crate::openai::OpenAIProvider::new(
                     cfg.base_url
@@ -409,6 +448,11 @@ pub mod factory {
                 )))
             }
         };
+        if cfg.text_tool_calls.unwrap_or(false) {
+            return Ok(Box::new(crate::text_tools::ToolCallExtractProvider::new(
+                std::sync::Arc::from(provider),
+            )));
+        }
         Ok(provider)
     }
 
@@ -459,7 +503,12 @@ pub mod factory {
             cfg.timeout_secs,
             cfg.max_retries,
         )?
-        .with_thinking(effort.thinking());
+        .with_thinking(effort.thinking())
+        .with_dialect(deepseeknova_core::PromptDialect {
+            lang: deepseeknova_core::PromptLang::Zh,
+            format: deepseeknova_core::PromptFormat::Markdown,
+            max_message_tokens: None,
+        });
         if let Some(e) = effort.effort_str() {
             p = p.with_reasoning_effort(e);
         }
@@ -470,14 +519,45 @@ pub mod factory {
         Ok(p)
     }
 
-    /// Sber GigaChat API provider. OAuth `client_id`/`client_secret` (from
-    /// config) drive the auth flow; reasoning-effort / thinking are not
-    /// translated (GigaChat has no such parameters). `X-Session-ID` comes from
-    /// `session_id` or is auto-generated per instance.
-    fn build_gigachat(
+    /// Resolve GigaChat OAuth credentials into `(client_id, client_secret)`.
+    ///
+    /// Priority:
+    /// 1. `auth_key` — the single base64 «ключ авторизации» Сбера
+    ///    (`base64(client_id:client_secret)`), decoded and split on the first
+    ///    `:`. This mirrors the official SDK `credentials` field.
+    /// 2. Explicit `client_id` + `client_secret` pair.
+    ///
+    /// Any of these present is sufficient; a malformed `auth_key` is a hard
+    /// config error (no silent fallback, to surface typos early).
+    fn resolve_gigachat_credentials(
         cfg: &ProviderConfig,
-        temperature: Option<f32>,
-    ) -> Result<crate::gigachat::GigaChatProvider, deepseeknova_core::DeepseeknovaError> {
+    ) -> Result<(String, String), deepseeknova_core::DeepseeknovaError> {
+        if let Some(auth_key) = cfg.auth_key.as_deref() {
+            let key = auth_key.trim();
+            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key)
+                .map_err(|e| {
+                deepseeknova_core::DeepseeknovaError::config(format!(
+                    "gigachat auth_key is not valid base64: {e}"
+                ))
+            })?;
+            let decoded = String::from_utf8(decoded).map_err(|e| {
+                deepseeknova_core::DeepseeknovaError::config(format!(
+                    "gigachat auth_key decodes to non-UTF8: {e}"
+                ))
+            })?;
+            let (client_id, client_secret) = decoded.split_once(':').ok_or_else(|| {
+                deepseeknova_core::DeepseeknovaError::config(
+                    "gigachat auth_key must decode to `client_id:client_secret`".to_string(),
+                )
+            })?;
+            if client_id.trim().is_empty() || client_secret.is_empty() {
+                return Err(deepseeknova_core::DeepseeknovaError::config(
+                    "gigachat auth_key decoded to empty client_id/client_secret".to_string(),
+                ));
+            }
+            return Ok((client_id.trim().to_string(), client_secret.to_string()));
+        }
+
         let client_id = cfg.client_id.clone().ok_or_else(|| {
             deepseeknova_core::DeepseeknovaError::config(
                 "gigachat provider requires client_id".to_string(),
@@ -488,6 +568,19 @@ pub mod factory {
                 "gigachat provider requires client_secret".to_string(),
             )
         })?;
+        Ok((client_id, client_secret))
+    }
+
+    /// Sber GigaChat API provider. OAuth `client_id`/`client_secret` (from
+    /// config) drive the auth flow; `reasoning_effort` maps onto
+    /// `reasoning_max_tokens` (see [`crate::gigachat::GigaChatProvider`]). `X-Session-ID` comes
+    /// from `session_id` or is auto-generated per instance.
+    fn build_gigachat(
+        cfg: &ProviderConfig,
+        temperature: Option<f32>,
+        effort: ReasoningEffort,
+    ) -> Result<crate::gigachat::GigaChatProvider, deepseeknova_core::DeepseeknovaError> {
+        let (client_id, client_secret) = resolve_gigachat_credentials(cfg)?;
 
         let mut p = crate::gigachat::GigaChatProvider::new(
             cfg.base_url.as_deref(),
@@ -505,6 +598,11 @@ pub mod factory {
         )?;
         if let Some(temp) = temperature {
             p = p.with_temperature(temp);
+        }
+        // Disabled → cap reasoning at 0 so the model answers in `content`
+        // rather than pouring its whole response into `reasoning_content`.
+        if matches!(effort, ReasoningEffort::Disabled) {
+            p = p.with_reasoning_max_tokens(0);
         }
         Ok(p)
     }
@@ -633,11 +731,13 @@ pub mod factory {
                 cache_prompt_key: None,
                 cache_exact: None,
                 oauth_url: None,
+                auth_key: None,
                 client_id: None,
                 client_secret: None,
                 scope: None,
                 session_id: None,
                 rq_uid: None,
+                text_tool_calls: None,
             }
         }
 
@@ -716,11 +816,13 @@ pub mod factory {
                 cache_prompt_key: None,
                 cache_exact: None,
                 oauth_url: None,
+                auth_key: None,
                 client_id: None,
                 client_secret: None,
                 scope: None,
                 session_id: None,
                 rq_uid: None,
+                text_tool_calls: None,
             };
             let result = create_provider(&cfg);
             let err = match result {
@@ -764,11 +866,13 @@ pub mod factory {
                 cache_prompt_key: None,
                 cache_exact: None,
                 oauth_url: None,
+                auth_key: None,
                 client_id: None,
                 client_secret: None,
                 scope: None,
                 session_id: None,
                 rq_uid: None,
+                text_tool_calls: None,
             }
         }
 
@@ -888,6 +992,70 @@ mod factory_tests {
         .unwrap();
         let p = crate::factory::create_provider(&cfg);
         assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn gigachat_kind_builds_provider_from_auth_key() {
+        // base64("my-client:my-secret") == bXktY2xpZW50Om15LXNlY3JldA==
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "giga"
+            kind = "gigachat"
+            base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+            model = "GigaChat-Pro-preview"
+            auth_key = "bXktY2xpZW50Om15LXNlY3JldA=="
+        "#,
+        )
+        .unwrap();
+        let p = crate::factory::create_provider(&cfg);
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn gigachat_auth_key_rejects_malformed_base64() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "giga"
+            kind = "gigachat"
+            base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+            model = "GigaChat-Pro-preview"
+            auth_key = "!!!not-base64!!!"
+        "#,
+        )
+        .unwrap();
+        let err = crate::factory::create_provider(&cfg);
+        assert!(
+            matches!(
+                err,
+                Err(deepseeknova_core::DeepseeknovaError::Config { .. })
+            ),
+            "malformed auth_key must be a config error, got: {:?}",
+            err.map(|_| "ok")
+        );
+    }
+
+    #[test]
+    fn gigachat_auth_key_rejects_missing_colon() {
+        // base64("no-colon-here") == bm8tY29sb24taGVyZQ==
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "giga"
+            kind = "gigachat"
+            base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+            model = "GigaChat-Pro-preview"
+            auth_key = "bm8tY29sb24taGVyZQ=="
+        "#,
+        )
+        .unwrap();
+        let err = crate::factory::create_provider(&cfg);
+        assert!(
+            matches!(
+                err,
+                Err(deepseeknova_core::DeepseeknovaError::Config { .. })
+            ),
+            "auth_key without colon must be a config error, got: {:?}",
+            err.map(|_| "ok")
+        );
     }
 }
 

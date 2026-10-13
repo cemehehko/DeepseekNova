@@ -54,6 +54,8 @@ impl Tool for ReadFileTool {
                 },
                 "required": ["path"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -193,6 +195,8 @@ impl Tool for WriteFileTool {
                 },
                 "required": ["path", "content"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -343,6 +347,8 @@ impl Tool for EditFileTool {
                 },
                 "required": ["path", "snippet_id"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -497,6 +503,8 @@ impl Tool for MoveFileTool {
                 },
                 "required": ["source", "destination"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 
@@ -586,6 +594,8 @@ impl Tool for DeleteFileTool {
                 },
                 "required": ["path"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

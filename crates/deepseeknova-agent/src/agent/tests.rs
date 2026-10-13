@@ -35,6 +35,8 @@ impl Tool for SpyTool {
             name: self.name.to_string(),
             description: "spy tool".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -677,6 +679,8 @@ async fn protocol_blocking_violation_rejects_tool_execution() {
                 name: "spy".to_string(),
                 description: "counting spy".to_string(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         fn read_only(&self) -> bool {
@@ -1558,6 +1562,8 @@ impl Tool for RecordingTool {
             name: "danger".to_string(),
             description: "writer tool".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -1832,6 +1838,8 @@ async fn injects_custom_extension_into_tool_context() {
                 name: "probe".into(),
                 description: "d".into(),
                 parameters: serde_json::json!({"type":"object","properties":{}}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         fn read_only(&self) -> bool {
@@ -2362,6 +2370,8 @@ impl Tool for McpWriteSpy {
             name: self.name.to_string(),
             description: "mcp write spy tool".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -2386,6 +2396,8 @@ impl Tool for WritableSpy {
             name: self.name.to_string(),
             description: "writable spy tool".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -2412,6 +2424,8 @@ impl Tool for BashSpy {
             name: "bash".to_string(),
             description: "bash spy".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -2646,6 +2660,8 @@ impl Tool for CountingSpy {
             name: self.name.to_string(),
             description: "counting spy".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -2673,6 +2689,8 @@ impl Tool for FailSpy {
             name: self.name.to_string(),
             description: "fail spy".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {
@@ -2949,6 +2967,8 @@ impl Tool for ParallelSpy {
             name: "delegate".to_string(),
             description: "parallel fan-out spy".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{}}),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
     fn read_only(&self) -> bool {

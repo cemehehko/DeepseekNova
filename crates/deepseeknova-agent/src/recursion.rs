@@ -126,6 +126,8 @@ impl Tool for RecursiveDelegateTool {
                 },
                 "required": ["agent", "goal"]
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

@@ -686,6 +686,8 @@ permissions.allow: ["*"]
                 name: self.0.to_string(),
                 description: "dummy".into(),
                 parameters: json!({}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
         async fn execute(

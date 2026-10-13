@@ -29,6 +29,8 @@ impl Tool for LsTool {
                 },
                 "required": []
             }),
+            few_shot_examples: None,
+            return_parameters: None,
         }
     }
 

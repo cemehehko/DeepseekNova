@@ -229,6 +229,15 @@ pub async fn run_loop(
             .unwrap_or_else(|e| e.into_inner())
             .model_label
             .clone();
+        // 授权状态：每帧从 runtime 刷新（后台 warm-up 完成后立即反映在 ⚡）。
+        app.auth_state = caps
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auth_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         terminal.draw(|f| app.draw(f))?;
 
         // 消费 `/` 面板待执行命令（真实 caps）。
@@ -609,6 +618,15 @@ pub async fn run_loop(
                                         });
                                     if inside {
                                         app.handle_mouse_click(m.row);
+                                    } else if app.ctx_segment_area.is_some_and(|r| {
+                                        m.row >= r.y
+                                            && m.row < r.y + r.height
+                                            && m.column >= r.x
+                                            && m.column < r.x + r.width
+                                    }) {
+                                        // 显式点击状态行里的 ctx 段（tokens/百分比文字）：
+                                        // 切换显示单位。点状态行其他位置不触发。
+                                        app.toggle_ctx_display();
                                     }
                                 }
                                 // grok 对齐：鼠标移动 = hover 高亮数据源（坐标入

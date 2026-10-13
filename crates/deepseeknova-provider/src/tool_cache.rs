@@ -95,6 +95,8 @@ mod tests {
                 name: "dummy".into(),
                 description: "does nothing".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             }
         }
 

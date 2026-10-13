@@ -745,11 +745,15 @@ mod cache_tests {
                 name: "zebra".into(),
                 description: "last".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             },
             ToolSchema {
                 name: "alpha".into(),
                 description: "first".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                few_shot_examples: None,
+                return_parameters: None,
             },
         ];
 
@@ -1194,6 +1198,8 @@ mod tests {
             name: "grep".into(),
             description: "search files".into(),
             parameters: serde_json::json!({}),
+            few_shot_examples: None,
+            return_parameters: None,
         }];
         let messages = PromptBuilder::build(
             "You are helpful.",

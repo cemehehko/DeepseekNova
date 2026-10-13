@@ -118,11 +118,13 @@ fn merge_preserves_provider_overrides() {
         cache_exact: None,
         context_window: None,
         oauth_url: None,
+        auth_key: None,
         client_id: None,
         client_secret: None,
         scope: None,
         session_id: None,
         rq_uid: None,
+        text_tool_calls: None,
     });
 
     let over = Config {
@@ -166,11 +168,13 @@ fn merge_overrides_non_default_providers() {
         cache_exact: None,
         context_window: None,
         oauth_url: None,
+        auth_key: None,
         client_id: None,
         client_secret: None,
         scope: None,
         session_id: None,
         rq_uid: None,
+        text_tool_calls: None,
     });
 
     let over = Config {
@@ -193,11 +197,13 @@ fn merge_overrides_non_default_providers() {
             cache_exact: None,
             context_window: None,
             oauth_url: None,
+            auth_key: None,
             client_id: None,
             client_secret: None,
             scope: None,
             session_id: None,
             rq_uid: None,
+            text_tool_calls: None,
         }],
         ..Default::default()
     };
@@ -256,11 +262,13 @@ fn resolve_provider_for_model() {
             cache_exact: None,
             context_window: None,
             oauth_url: None,
+            auth_key: None,
             client_id: None,
             client_secret: None,
             scope: None,
             session_id: None,
             rq_uid: None,
+            text_tool_calls: None,
         }],
         models: vec![ModelConfig {
             name: "deepseek-v4-flash".into(),

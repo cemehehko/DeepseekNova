@@ -38,6 +38,18 @@ client_id = "…"
 client_secret = "…"
 ```
 
+Аутентификацию можно задать двумя способами (выберите один):
+
+- **Пара `client_id` + `client_secret`** — как в примере выше.
+- **`auth_key`** — единый «ключ авторизации» Сбера
+  `base64(client_id:client_secret)`, который выдаёт личный кабинет GigaChat
+  и принимает официальный SDK в поле `credentials`. Провайдер декодирует
+  его и расщепляет на пару для OAuth Basic-auth. Приоритетен над парой:
+
+```toml
+auth_key = "<base64(client_id:client_secret) из личного кабинета GigaChat>"
+```
+
 ### Необязательные поля
 
 ```toml
